@@ -1,8 +1,10 @@
 # Recall Ranker Comparison
 
 A tool for comparing recall between control and variant L1 ranker engines.
-## Assumptions:
+
+## Assumptions
 When generating the recall analysis report, the engine name used was the same as the model name in config_search_usgm.
+
 ## Setup
 
 ```bash
@@ -23,10 +25,12 @@ bash run_recall_analysis.sh gs://p0y01cc/l1_recall_analysis/nlfv3-utbeta/1768984
 
 # Download from GCS and run analysis (specific engine)
 bash run_recall_analysis.sh gs://p0y01cc/l1_recall_analysis/nlfv3-utbeta/1768984441/sample-5000/qip_scores.parquet engine_name
+```
 
 ## Output
 
 The script generates a timestamped output folder:
+
 ```
 output/recall_ranker_comparison_YYYYMMDD_HHMMSS/
 ├── <engine_name>/
@@ -42,5 +46,5 @@ output/recall_ranker_comparison_YYYYMMDD_HHMMSS/
 - **Filtered T-Test**: Filters queries with min_total ≥ 400 and total_diff < 5 (since ranker improvements shouldn't change match size)
 - **Good/Bad Query Breakdown**: Shows gained/lost 4s and removed/added non-4s per query
 - **Sunlight Links**: Pre-populated links for quick debugging:
-    --pre-config release (using _seh) 
-    --config released
+  - Pre-config release (using _seh)
+  - Config released
