@@ -87,52 +87,54 @@ def extract_query_intent_attributes(data: Dict[str, Any]) -> Dict[str, Any]:
         for ann in annotations:
             attribute = ann.get("attribute", "").lower()
 
-            # Extract catalog mappings (has values and scores)
+            # Helper function to add attribute value
+            def add_attribute_value(attr_name, value, score=1.0):
+                if not value:
+                    return
+                if attr_name == "product_type":
+                    attributes["product_type"].append({"value": value, "score": score})
+                elif attr_name == "brand":
+                    attributes["brand"].append({"value": value, "score": score})
+                elif attr_name == "color":
+                    attributes["color"].append({"value": value, "score": score})
+                elif attr_name == "gender":
+                    attributes["gender"].append({"value": value, "score": score})
+                elif attr_name == "category":
+                    attributes["category"].append({"value": value, "score": score})
+                elif attr_name == "size":
+                    attributes["size"].append({"value": value, "score": score})
+                elif attr_name == "material":
+                    attributes["material"].append({"value": value, "score": score})
+                elif attr_name == "pattern":
+                    attributes["pattern"].append({"value": value, "score": score})
+                elif attr_name == "style":
+                    attributes["style"].append({"value": value, "score": score})
+                elif attr_name == "age_group":
+                    attributes["age_group"].append({"value": value, "score": score})
+                elif attr_name == "occasion":
+                    attributes["occasion"].append({"value": value, "score": score})
+                elif attr_name == "synonym":
+                    attributes["synonyms"].append(value)
+                else:
+                    # Store other attributes
+                    if attr_name not in attributes["other_attributes"]:
+                        attributes["other_attributes"][attr_name] = []
+                    attributes["other_attributes"][attr_name].append({"value": value, "score": score})
+
+            # 1. Extract from catalogMappings (has values and scores)
             catalog_mappings = ann.get("catalogMappings", [])
             for mapping in catalog_mappings:
                 values = mapping.get("values", [])
-
                 for val in values:
                     name = val.get("name")
                     score = val.get("score", 0)
+                    add_attribute_value(attribute, name, score)
 
-                    if not name:
-                        continue
-
-                    # Categorize by attribute type
-                    if attribute == "product_type":
-                        attributes["product_type"].append({"value": name, "score": score})
-                    elif attribute == "brand":
-                        attributes["brand"].append({"value": name, "score": score})
-                    elif attribute == "color":
-                        attributes["color"].append({"value": name, "score": score})
-                    elif attribute == "gender":
-                        attributes["gender"].append({"value": name, "score": score})
-                    elif attribute == "category":
-                        attributes["category"].append({"value": name, "score": score})
-                    elif attribute == "size":
-                        attributes["size"].append({"value": name, "score": score})
-                    elif attribute == "material":
-                        attributes["material"].append({"value": name, "score": score})
-                    elif attribute == "pattern":
-                        attributes["pattern"].append({"value": name, "score": score})
-                    elif attribute == "style":
-                        attributes["style"].append({"value": name, "score": score})
-                    elif attribute == "age_group":
-                        attributes["age_group"].append({"value": name, "score": score})
-                    elif attribute == "occasion":
-                        attributes["occasion"].append({"value": name, "score": score})
-                    else:
-                        # Store other attributes
-                        if attribute not in attributes["other_attributes"]:
-                            attributes["other_attributes"][attribute] = []
-                        attributes["other_attributes"][attribute].append({"value": name, "score": score})
-
-            # Extract synonyms (if available)
-            if attribute == "synonym":
-                synonym_value = ann.get("value")
-                if synonym_value:
-                    attributes["synonyms"].append(synonym_value)
+            # 2. Extract direct value from annotation (fallback if no catalogMappings)
+            if not catalog_mappings:
+                direct_value = ann.get("value")
+                if direct_value:
+                    add_attribute_value(attribute, direct_value, 1.0)
 
     # Also extract from qcResult.categories
     qc = data.get("qcResult", {})
@@ -161,6 +163,29 @@ def extract_query_intent_attributes(data: Dict[str, Any]) -> Dict[str, Any]:
     return attributes
 
 
+def clean_query_for_perceive(query: str) -> str:
+    """
+    Clean query by removing store/zipcode parameters.
+
+    Examples:
+        "valentines day pajamas for women (stores=1327, zipcode=47037)"
+        -> "valentines day pajamas for women"
+
+        "milk (facet=fulfillment_method:Delivery, stores=1714, zipcode=26554)"
+        -> "milk"
+
+    Args:
+        query: Raw query string
+
+    Returns:
+        Cleaned query without store/zipcode parameters
+    """
+    import re
+    # Remove everything in parentheses that contains "stores=" or "zipcode=" or "facet="
+    cleaned = re.sub(r'\s*\([^)]*(?:stores=|zipcode=|facet=)[^)]*\)\s*', '', query)
+    return cleaned.strip()
+
+
 async def fetch_query_context(
     query: str,
     session: ClientSession,
@@ -173,7 +198,7 @@ async def fetch_query_context(
     Fetch query context from Perceive API.
 
     Args:
-        query: Search query string
+        query: Search query string (may include store/zipcode parameters)
         session: aiohttp session
         sem: Semaphore for concurrency control
         retry_limit: Max retries
@@ -183,7 +208,10 @@ async def fetch_query_context(
     Returns:
         Dictionary with query context and structured attributes
     """
-    url = f"http://perceive-gm-wcnp.prodb.walmart.com/perceive/v2/modular/iu?query={quote(query, safe='')}&includeQC=true"
+    # Clean query to remove store/zipcode parameters for consistent Perceive results
+    cleaned_query = clean_query_for_perceive(query)
+
+    url = f"http://perceive-gm-wcnp.prodb.walmart.com/perceive/v2/modular/iu?query={quote(cleaned_query, safe='')}&includeQC=true"
 
     for attempt in range(1, retry_limit + 1):
         try:

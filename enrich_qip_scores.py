@@ -22,8 +22,8 @@ from skills.query_context import run, QueryContextInput
 
 def main():
     parser = argparse.ArgumentParser(description='Enrich QIP scores with query context')
-    parser.add_argument('--queries', type=int, default=100,
-                        help='Number of unique queries to enrich (default: 100)')
+    parser.add_argument('--queries', type=int, default=None,
+                        help='Number of unique queries to enrich (default: all queries)')
     parser.add_argument('--sample-rows', type=int,
                         help='Optional: Sample N rows first (for faster loading), then extract unique queries')
     parser.add_argument('--concurrency', type=int, default=100,
@@ -34,6 +34,9 @@ def main():
     parser.add_argument('--input', type=str,
                         default='./temp/downloaded_files/qip_scores.parquet',
                         help='Input QIP scores file')
+    parser.add_argument('--item-attributes', type=str,
+                        default='./temp/downloaded_files/item_attributes_sample-5000.jsonl',
+                        help='Item attributes JSONL file')
 
     args = parser.parse_args()
 
@@ -117,7 +120,7 @@ def main():
     print(f"  Enriched {len(df_enriched):,} rows with query context")
 
     # Join with item attributes
-    item_attrs_path = './temp/downloaded_files/item_attributes_sample-5000.jsonl'
+    item_attrs_path = args.item_attributes
     if Path(item_attrs_path).exists():
         print(f"\nJoining with item attributes...")
         attrs_df = pd.read_json(item_attrs_path, lines=True)

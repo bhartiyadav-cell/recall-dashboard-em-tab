@@ -6,3 +6,22 @@ __pycache__/
 *.ipynb
 *.parquet
 temp/downloaded_files/
+
+# Email files and reports
+emails/
+reports/
+
+# Debug and test scripts
+check_*.py
+debug_*.py
+test_*.py
+inspect_*.py
+show_*.py
+view_*.py
+re_enrich_*.py
+enrich_single_query_debug.py
+download_email_simple.py
+decode_email_body.py
+filter_*.py
+create_qi_pairs_for_analysis.py
+regenerate_pairs.sh
