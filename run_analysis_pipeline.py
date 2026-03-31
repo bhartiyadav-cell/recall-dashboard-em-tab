@@ -116,6 +116,11 @@ Example:
         action='store_true',
         help='Skip query enrichment if already done'
     )
+    parser.add_argument(
+        '--skip-pgls',
+        action='store_true',
+        help='Skip pgls_id fetching from Solr if already done'
+    )
 
     args = parser.parse_args()
 
@@ -271,10 +276,42 @@ Example:
 
         steps_completed.append("Attribute matching analysis")
 
-        # Step 6: Generate HTML report
+        # Step 6: Fetch pgls_id from Solr
+        qip_pairs_with_pgls = temp_dir / f"{base_name}_qip_pairs_with_matching_with_pgls.parquet"
+
+        if not args.skip_pgls:
+            print("\n" + "="*80)
+            print("STEP 6: Fetching pgls_id from Solr")
+            print("="*80)
+
+            # Import pgls fetcher
+            from fetch_pgls_ids import enrich_with_pgls_id
+
+            try:
+                enrich_with_pgls_id(
+                    input_file=str(qip_pairs_with_matching),
+                    output_file=str(qip_pairs_with_pgls),
+                    batch_size=50
+                )
+            except Exception as e:
+                print(f"\n⚠️  Error fetching pgls_id: {e}")
+                print("Continuing with report generation without pgls_id...")
+                qip_pairs_with_pgls = qip_pairs_with_matching
+
+            steps_completed.append("Fetch pgls_id from Solr")
+        else:
+            print("\n⏭️  Skipping pgls_id fetching (--skip-pgls)")
+            # Check if file already exists
+            if qip_pairs_with_pgls.exists():
+                print(f"✅ Using existing pgls_id file: {qip_pairs_with_pgls}")
+            else:
+                print(f"⚠️  pgls_id file not found, using file without pgls_id")
+                qip_pairs_with_pgls = qip_pairs_with_matching
+
+        # Step 7: Generate HTML report
         cmd = [
             'python', 'generate_4s_report.py',
-            '--input', str(qip_pairs_with_matching),
+            '--input', str(qip_pairs_with_pgls),
             '--output', str(html_report),
             '--with-matching'
         ]
@@ -306,6 +343,7 @@ Example:
         print(f"  Filtered QIP Scores:  {qip_scores_filtered}")
         print(f"  QI Pairs:             {qip_pairs}")
         print(f"  QI Pairs w/ Matching: {qip_pairs_with_matching}")
+        print(f"  QI Pairs w/ pgls_id:  {qip_pairs_with_pgls}")
         print(f"  HTML Report:          {html_report}")
 
         print(f"\n🌐 Open report in browser:")
@@ -336,6 +374,7 @@ Example:
                 'qip_scores_filtered': str(qip_scores_filtered),
                 'qip_pairs': str(qip_pairs),
                 'qip_pairs_with_matching': str(qip_pairs_with_matching),
+                'qip_pairs_with_pgls': str(qip_pairs_with_pgls),
                 'html_report': str(html_report)
             }
         }

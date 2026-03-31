@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Generate HTML Report for 4s Added Analysis.
+Generate HTML Report for 4s Added Analysis (v2 with Top-40 Analysis).
 
 Creates an interactive HTML report showing queries where variant added 4-rated items,
-with attribute matching analysis and insights.
+with attribute matching analysis and top-40 Preso crawl impact insights.
 
 Usage:
-    python generate_4s_report.py
-    python generate_4s_report.py --output ./reports/4s_added_report.html
+    python generate_4s_report_v2.py
+    python generate_4s_report_v2.py --output ./reports/4s_added_report.html
 """
 
 import argparse
@@ -52,7 +52,7 @@ def generate_html_report(
     variant_engine: str,
     rating_distributions: dict = None
 ):
-    """Generate interactive HTML report for 4s added."""
+    """Generate interactive HTML report for 4s added with top-40 analysis."""
 
     html_id = str(uuid.uuid4()).replace("-", "")
 
@@ -64,7 +64,7 @@ def generate_html_report(
 
     # Keep only columns we need for the HTML (reduce file size!)
     cols_to_keep = [
-        query_col, 'pg_prod_id', 'change_type',
+        query_col, 'pg_prod_id', 'pgls_id', 'change_type',
         'label_ctrl', 'label_var',  # Keep labels to show rating for non4_removed
         # All intent types from Perceive API
         'product_type_intent', 'brand_intent', 'color_intent', 'gender_intent',
@@ -76,7 +76,9 @@ def generate_html_report(
         'title_var', 'product_type_var', 'brand_var', 'color_var', 'gender_var',
         'title_ctrl', 'product_type_ctrl', 'brand_ctrl', 'color_ctrl', 'gender_ctrl',
         # Matching scores
-        'overall_match', 'pt_exact_match', 'brand_exact_match', 'title_match'
+        'overall_match', 'pt_exact_match', 'brand_exact_match', 'title_match',
+        # Top-40 columns
+        'in_control_top40', 'control_rank', 'in_variant_top40', 'variant_rank'
     ]
     # Only keep columns that actually exist
     cols_to_keep = [col for col in cols_to_keep if col in items_of_interest.columns]
@@ -85,18 +87,29 @@ def generate_html_report(
     # Separate for statistics (4s_gained only for query summary)
     fours_gained = items_of_interest[items_of_interest['change_type'] == '4_gained'].copy()
 
-    query_summary = fours_gained.groupby(query_col).agg({
+    # Compute summary stats including top-40 counts
+    agg_dict = {
         'pg_prod_id': 'count',
         'overall_match': 'mean',
         'pt_exact_match': 'mean',
         'brand_exact_match': 'mean',
         'title_match': 'mean'
-    }).rename(columns={
+    }
+
+    # Add top-40 counts if columns exist
+    if 'in_variant_top40' in fours_gained.columns:
+        agg_dict['in_variant_top40'] = 'sum'
+    if 'in_control_top40' in fours_gained.columns:
+        agg_dict['in_control_top40'] = 'sum'
+
+    query_summary = fours_gained.groupby(query_col).agg(agg_dict).rename(columns={
         'pg_prod_id': 'count_4s_added',
         'overall_match': 'avg_match',
         'pt_exact_match': 'avg_pt_match',
         'brand_exact_match': 'avg_brand_match',
-        'title_match': 'avg_title_match'
+        'title_match': 'avg_title_match',
+        'in_variant_top40': 'count_4s_in_top40',
+        'in_control_top40': 'count_4s_in_control_top40'
     }).sort_values('count_4s_added', ascending=False)
 
     # Add query intents and net 4s gain to summary
@@ -140,7 +153,14 @@ def generate_html_report(
         else:
             match_str = f"{avg_match:.0%}"
 
-        query_options += f'<option value="{query}">{query[:60]}... (+{net_gain} net 4s, {count} new, {match_str} match)</option>\n'
+        # Add top-40 info if available
+        top40_str = ""
+        if 'count_4s_in_top40' in query_summary.columns:
+            count_in_top40 = int(query_summary.loc[query, 'count_4s_in_top40']) if not pd.isna(query_summary.loc[query, 'count_4s_in_top40']) else 0
+            if count_in_top40 > 0:
+                top40_str = f", 🎯{count_in_top40} in top-40"
+
+        query_options += f'<option value="{query}">{query[:60]}... (+{net_gain} net 4s, {count} new, {match_str} match{top40_str})</option>\n'
 
     # Convert data to JSON (include both 4s_gained and non4_removed)
     items_json = items_of_interest.to_json(orient='records', default_handler=str)
@@ -159,6 +179,17 @@ def generate_html_report(
             'avg_title_match': fours_gained['title_match'].mean() if 'title_match' in fours_gained.columns else 0,
         }
 
+    # Add top-40 statistics
+    top40_stats = {}
+    if 'in_variant_top40' in fours_gained.columns:
+        top40_stats['4s_in_variant_top40'] = int(fours_gained['in_variant_top40'].sum())
+        top40_stats['pct_4s_in_top40'] = (top40_stats['4s_in_variant_top40'] / len(fours_gained) * 100) if len(fours_gained) > 0 else 0
+
+    # Get non-4s removed stats for top-40
+    non4s_removed = items_of_interest[items_of_interest['change_type'] == 'non4_removed']
+    if 'in_control_top40' in non4s_removed.columns:
+        top40_stats['non4s_in_control_top40'] = int(non4s_removed['in_control_top40'].sum())
+
     # Format insights
     insights_html = ""
     for insight in insights:
@@ -169,7 +200,7 @@ def generate_html_report(
 <html>
 <head>
 <meta charset="UTF-8">
-<title>4s Added Analysis: {variant_engine} vs {control_engine}</title>
+<title>4s Added Analysis v2: {variant_engine} vs {control_engine}</title>
 <style>
   body {{
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
@@ -450,7 +481,7 @@ def generate_html_report(
 <body>
 
 <div class="header">
-  <h1>🎯 4s Added Analysis</h1>
+  <h1>🎯 4s Added Analysis v2 (with Top-40 Impact)</h1>
   <p><strong>Variant:</strong> {variant_engine} vs <strong>Control:</strong> {control_engine}</p>
   <p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
 </div>
@@ -484,6 +515,18 @@ def generate_html_report(
       <div class="value">{len(query_summary)}</div>
     </div>
   </div>
+
+  {'<h3 style="margin-top: 30px; color: #10b981;">🎯 Top-40 Visibility Impact</h3>' if top40_stats else ''}
+  {'<div class="stats-grid">' if top40_stats else ''}
+    {'<div class="stat-card" style="border-left: 4px solid #10b981;">' if top40_stats.get("4s_in_variant_top40", 0) > 0 else ''}
+      {'<div class="label">4s Added in Variant Top-40</div>' if top40_stats.get("4s_in_variant_top40", 0) > 0 else ''}
+      {'<div class="value" style="color: #10b981;">' + f'{top40_stats["4s_in_variant_top40"]:,}' + f' ({top40_stats["pct_4s_in_top40"]:.1f}%)' + '</div>' if top40_stats.get("4s_in_variant_top40", 0) > 0 else ''}
+    {'</div>' if top40_stats.get("4s_in_variant_top40", 0) > 0 else ''}
+    {'<div class="stat-card" style="border-left: 4px solid #ef4444;">' if top40_stats.get("non4s_in_control_top40", 0) > 0 else ''}
+      {'<div class="label">Non-4s Removed from Control Top-40</div>' if top40_stats.get("non4s_in_control_top40", 0) > 0 else ''}
+      {'<div class="value" style="color: #ef4444;">' + f'{top40_stats["non4s_in_control_top40"]:,}' + '</div>' if top40_stats.get("non4s_in_control_top40", 0) > 0 else ''}
+    {'</div>' if top40_stats.get("non4s_in_control_top40", 0) > 0 else ''}
+  {'</div>' if top40_stats else ''}
 
   <h3 style="margin-top: 30px;">💡 Key Insights</h3>
   <ul class="insights-list">
@@ -719,10 +762,35 @@ function updateQueryView_{html_id}() {{
       rankInfo += '</div>';
     }}
 
+    // Display product IDs
+    const pgls_id = item.pgls_id || null;
+    let productIdHtml = '';
+
+    if (pgls_id) {{
+      const walmartUrl = `https://www.walmart.com/ip/a/${{pgls_id}}`;
+      productIdHtml = `
+        <div class="item-id" style="display: flex; flex-direction: column; gap: 4px;">
+          <div>
+            <strong>pgls_id:</strong> <span style="color: #10b981; font-family: monospace;">${{pgls_id}}</span>
+            <a href="${{walmartUrl}}" target="_blank" style="margin-left: 8px; font-size: 11px; color: #0071ce; text-decoration: none; font-weight: 600;">🛒 View on Walmart.com</a>
+          </div>
+          <div style="font-size: 11px; color: #6b7280;"><strong>pg_prod_id:</strong> ${{item.pg_prod_id}}</div>
+        </div>
+      `;
+    }} else {{
+      const solrUrl = `http://app.b2cprodb.solr.polaris.glb.us.walmart.net/solr/polaris/select?fl=pgls_id%2Cpg_prod_id&fq=pg_prod_id%3A${{item.pg_prod_id}}&indent=true&q.op=OR&q=*%3A*&wt=json`;
+      productIdHtml = `
+        <div class="item-id">
+          <strong>pg_prod_id:</strong> ${{item.pg_prod_id}}
+          <a href="${{solrUrl}}" target="_blank" style="margin-left: 8px; font-size: 11px; color: #3b82f6; text-decoration: none;">🔍 Get pgls_id</a>
+        </div>
+      `;
+    }}
+
     itemsHtml += `
       <div class="item-card" style="${{item.change_type === 'non4_removed' ? 'border-left: 4px solid #ef4444;' : 'border-left: 4px solid #10b981;'}}">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-          <div class="item-id">${{item.pg_prod_id}}</div>
+          ${{productIdHtml}}
           <div style="display: flex; align-items: center;">
             ${{changeTypeBadge}}
             ${{top40Badge}}
@@ -764,7 +832,7 @@ function updateQueryView_{html_id}() {{
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate HTML report for 4s added')
+    parser = argparse.ArgumentParser(description='Generate HTML report for 4s added (v2 with top-40)')
     parser.add_argument(
         '--input',
         type=str,
@@ -774,7 +842,7 @@ def main():
     parser.add_argument(
         '--output',
         type=str,
-        default='./reports/4s_added_report.html',
+        default='./reports/4s_added_report_v2.html',
         help='Output HTML file'
     )
     parser.add_argument(
@@ -805,10 +873,12 @@ def main():
     # Load and join item attributes if available
     # Try multiple replacement patterns (order matters - most specific first!)
     item_attrs_path = input_file
-    if '_qip_pairs_with_matching_with_pgls.parquet' in item_attrs_path:
-        item_attrs_path = item_attrs_path.replace('_qip_pairs_with_matching_with_pgls.parquet', '_item_attributes.jsonl')
+    if '_qip_pairs_with_top40_with_pgls.parquet' in item_attrs_path:
+        item_attrs_path = item_attrs_path.replace('_qip_pairs_with_top40_with_pgls.parquet', '_item_attributes.jsonl')
     elif '_qip_pairs_with_matching.parquet' in item_attrs_path:
         item_attrs_path = item_attrs_path.replace('_qip_pairs_with_matching.parquet', '_item_attributes.jsonl')
+    elif '_qip_pairs_with_top40.parquet' in item_attrs_path:
+        item_attrs_path = item_attrs_path.replace('_qip_pairs_with_top40.parquet', '_item_attributes.jsonl')
     elif '_qip_4s_with_top40.parquet' in item_attrs_path:
         item_attrs_path = item_attrs_path.replace('_qip_4s_with_top40.parquet', '_item_attributes.jsonl')
     elif '_qip_with_top40.parquet' in item_attrs_path:
@@ -885,10 +955,12 @@ def main():
     # Load filtered QIP scores to get rating distributions per query
     # Try multiple replacement patterns (order matters - most specific first!)
     filtered_qip_path = input_file
-    if '_qip_pairs_with_matching_with_pgls.parquet' in filtered_qip_path:
-        filtered_qip_path = filtered_qip_path.replace('_qip_pairs_with_matching_with_pgls.parquet', '_qip_4s_gain_filtered.parquet')
+    if '_qip_pairs_with_top40_with_pgls.parquet' in filtered_qip_path:
+        filtered_qip_path = filtered_qip_path.replace('_qip_pairs_with_top40_with_pgls.parquet', '_qip_4s_gain_filtered.parquet')
     elif '_qip_pairs_with_matching.parquet' in filtered_qip_path:
         filtered_qip_path = filtered_qip_path.replace('_qip_pairs_with_matching.parquet', '_qip_4s_gain_filtered.parquet')
+    elif '_qip_pairs_with_top40.parquet' in filtered_qip_path:
+        filtered_qip_path = filtered_qip_path.replace('_qip_pairs_with_top40.parquet', '_qip_4s_gain_filtered.parquet')
     elif '_qip_pairs.parquet' in filtered_qip_path:
         filtered_qip_path = filtered_qip_path.replace('_qip_pairs.parquet', '_qip_4s_gain_filtered.parquet')
 
@@ -943,8 +1015,19 @@ def main():
         if fours_gained['title_match'].mean() > 0.5:
             insights.append(f"High title relevance: {fours_gained['title_match'].mean():.0%} of query intents appear in item titles")
 
+    # Add top-40 insights if columns exist
+    if 'in_variant_top40' in df.columns:
+        top40_gains = fours_gained[fours_gained['in_variant_top40'] == True]
+        if len(top40_gains) > 0:
+            pct_in_top40 = len(top40_gains) / len(fours_gained) * 100
+            insights.append(f"🎯 {pct_in_top40:.1f}% of 4s added appear in variant top-40 results")
+
+        new_in_top40 = fours_gained[(fours_gained['in_variant_top40'] == True) & (fours_gained['in_control_top40'] == False)]
+        if len(new_in_top40) > 0:
+            insights.append(f"🆕 {len(new_in_top40)} items newly appeared in top-40 (high impact gains)")
+
     # Generate report
-    print("\nGenerating HTML report...")
+    print("\nGenerating HTML report v2...")
     output_path = generate_html_report(
         df,
         {'4_gained': {
@@ -961,7 +1044,7 @@ def main():
         rating_distributions
     )
 
-    print(f"\n✅ Report generated: {output_path}")
+    print(f"\n✅ Report v2 generated: {output_path}")
     print(f"\nOpen in browser: file://{Path(output_path).absolute()}")
 
     return 0

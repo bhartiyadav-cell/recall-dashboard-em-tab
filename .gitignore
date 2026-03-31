@@ -1,27 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Generated data files (but keep directory structure)
+temp/downloaded_files/*.parquet
+temp/downloaded_files/*.jsonl
+temp/downloaded_files/*.json
+!temp/downloaded_files/.gitkeep
+
+# Generated reports (but keep directory structure)
+reports/*.html
+reports/*.json
+!reports/.gitkeep
+
+# Trash directory (cleanup artifacts)
+trash/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Utility scripts (not needed in git)
+cleanup_repo.py
+
+# Temporary files
+*.tmp
+*.bak
+
+# Large data and output directories
 output/
 data/
-*.pyc
-__pycache__/
-.DS_Store
-*.ipynb
 *.parquet
-temp/downloaded_files/
 
-# Email files and reports
-emails/
-reports/
-
-# Debug and test scripts
-check_*.py
-debug_*.py
-test_*.py
-inspect_*.py
-show_*.py
-view_*.py
-re_enrich_*.py
-enrich_single_query_debug.py
-download_email_simple.py
-decode_email_body.py
-filter_*.py
-create_qi_pairs_for_analysis.py
-regenerate_pairs.sh
+# Old patterns (kept for reference)
+# *.ipynb
