@@ -31,7 +31,6 @@ pip install -r requirements.txt
 ```bash
 python run_analysis_pipeline.py \
   --gcs-path "gs://k0k01ls/l1_recall_analysis/experiment_id/sample-5000/" \
-  --experiment-id "my_experiment"
 ```
 
 **Optional flags:**
@@ -44,7 +43,6 @@ python run_analysis_pipeline.py \
 ```bash
 python run_analysis_pipeline_v2.py \
   --email ./emails/experiment.eml \
-  --experiment-id "1773649932"
 ```
 
 **Optional flags:**
