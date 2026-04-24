@@ -21,7 +21,7 @@ The script:
      - Query distribution breakdown
      - Per-label significant-change tables (top driving + counteracting tabs)
      - Per-query item grid grouped by label section (Good/Bad/Concern signal)
-     - Sunlight deep-links on every item card
+     - Dual Preso deep-links on every item card (control vs variant side-by-side)
 """
 
 import argparse
@@ -74,14 +74,14 @@ def gcs_download(gcs_uri: str, local_path: str):
     print(f"  ✅ Downloaded {size_mb:.1f} MB")
 
 
-def resolve_parquet(gcs_path: str, subfolder: str | None, cache_dir: str, experiment_id: str) -> str:
+def resolve_parquet(gcs_path: str, subfolder: str | None, cache_dir: str, experiment_id: str) -> tuple[str, str]:
     """
     Find and download qip_scores.parquet. Tries (in order):
       1. --subfolder argument if given
       2. impacted/
       3. sample-1000/
       4. root of gcs_path
-    Returns local file path.
+    Returns (local file path, resolved subfolder string).
     """
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     local_path = str(Path(cache_dir) / f"{experiment_id}_qip_scores.parquet")
@@ -89,27 +89,76 @@ def resolve_parquet(gcs_path: str, subfolder: str | None, cache_dir: str, experi
     if Path(local_path).exists():
         size_mb = Path(local_path).stat().st_size / 1024 / 1024
         print(f"  Using cached parquet: {local_path} ({size_mb:.1f} MB)")
-        return local_path
+        # Best-effort: figure out which subfolder it came from
+        for sf in (subfolder, "impacted", "sample-1000", ""):
+            if sf is None: continue
+            uri = f"{gcs_path.rstrip('/')}/{sf}/qip_scores.parquet" if sf else f"{gcs_path.rstrip('/')}/qip_scores.parquet"
+            if gcs_exists(uri):
+                return local_path, sf
+        return local_path, subfolder or "impacted"
 
     candidates = []
     if subfolder:
-        candidates = [f"{gcs_path.rstrip('/')}/{subfolder}/qip_scores.parquet"]
+        candidates = [(subfolder, f"{gcs_path.rstrip('/')}/{subfolder}/qip_scores.parquet")]
     else:
         candidates = [
-            f"{gcs_path.rstrip('/')}/impacted/qip_scores.parquet",
-            f"{gcs_path.rstrip('/')}/sample-1000/qip_scores.parquet",
-            f"{gcs_path.rstrip('/')}/qip_scores.parquet",
+            ("impacted",     f"{gcs_path.rstrip('/')}/impacted/qip_scores.parquet"),
+            ("sample-1000",  f"{gcs_path.rstrip('/')}/sample-1000/qip_scores.parquet"),
+            ("",             f"{gcs_path.rstrip('/')}/qip_scores.parquet"),
         ]
 
-    for uri in candidates:
+    for sf, uri in candidates:
         if gcs_exists(uri):
             gcs_download(uri, local_path)
-            return local_path
+            return local_path, sf
 
     raise FileNotFoundError(
         f"Could not find qip_scores.parquet in any of:\n" +
-        "\n".join(f"  {c}" for c in candidates)
+        "\n".join(f"  {uri}" for _, uri in candidates)
     )
+
+
+def extract_ptss_trsp(gcs_path: str, subfolder: str) -> dict:
+    """
+    Read the first line of combined-polaris_crawl.jsonl from GCS and extract
+    ptss / trsp for each non-control engine. Returns dict keyed by engine name.
+    """
+    from urllib.parse import urlparse, parse_qs, unquote as _unquote
+    sf = subfolder.strip("/")
+    jsonl_uri = f"{gcs_path.rstrip('/')}/{sf}/combined-polaris_crawl.jsonl" if sf \
+                else f"{gcs_path.rstrip('/')}/combined-polaris_crawl.jsonl"
+
+    print(f"  Reading config from: {jsonl_uri}")
+    r = subprocess.run(
+        ["gsutil", "cat", jsonl_uri],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        print(f"  ⚠️  Could not read JSONL ({r.stderr.strip()}) — dual preso links disabled")
+        return {}
+
+    try:
+        import json as _json
+        first_line = r.stdout.splitlines()[0]
+        data = _json.loads(first_line)
+        engines_data = data["contextualQueriesWithResponses"][0]["engines"]
+        result = {}
+        for engine_name, engine_info in engines_data.items():
+            if engine_name == "control":
+                continue
+            url = engine_info.get("url", "")
+            parsed = urlparse(url)
+            params = parse_qs(parsed.query)
+            raw_ptss = _unquote(params.get("ptss", [""])[0])
+            trsp     = _unquote(params.get("trsp", [""])[0])
+            # Strip api_rerank_v2:off from ptss
+            clean_ptss = ";".join(p for p in raw_ptss.split(";") if p and "api_rerank_v2" not in p)
+            result[engine_name] = {"ptss": clean_ptss, "trsp": trsp}
+            print(f"  {engine_name}: ptss={clean_ptss!r}  trsp={trsp!r}")
+        return result
+    except Exception as e:
+        print(f"  ⚠️  Failed to parse JSONL config: {e} — dual preso links disabled")
+        return {}
 
 
 # ─── Query clean helper ────────────────────────────────────────────────────────
@@ -120,7 +169,7 @@ def clean_query(q: str) -> str:
 
 # ─── Main pipeline ─────────────────────────────────────────────────────────────
 
-def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs_path: str = ""):
+def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs_path: str = "", resolved_subfolder: str = ""):
 
     # ── Load ──────────────────────────────────────────────────────────────────
     print(f"\nLoading parquet: {parquet_path}")
@@ -144,6 +193,17 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
         CONTROL_ENGINE, VARIANT_ENGINE = engines[0], engines[1]
     print(f"  Control: {CONTROL_ENGINE}  |  Variant: {VARIANT_ENGINE}")
 
+    # ── Extract ptss / trsp from JSONL config ──────────────────────────────────
+    ptss_trsp_config = {}
+    if gcs_path and resolved_subfolder is not None:
+        print("\nExtracting ptss/trsp from JSONL config...")
+        ptss_trsp_config = extract_ptss_trsp(gcs_path, resolved_subfolder)
+    variant_ptss = ptss_trsp_config.get(VARIANT_ENGINE, {}).get("ptss", "")
+    variant_trsp = ptss_trsp_config.get(VARIANT_ENGINE, {}).get("trsp", "")
+    has_dual_preso = bool(
+        all(c in df_imp.columns for c in ['stores', 'state', 'zipcode']) and variant_ptss
+    )
+
     # ── Common queries ─────────────────────────────────────────────────────────
     df_imp['cleanQuery'] = df_imp['contextualQuery'].apply(clean_query)
     q_ctrl = set(df_imp[df_imp['engine'] == CONTROL_ENGINE]['contextualQuery'].unique())
@@ -151,6 +211,19 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
     common = q_ctrl & q_var
     print(f"  Queries in both engines: {len(common)}")
     df_c = df_imp[df_imp['contextualQuery'].isin(common)].copy()
+
+    # ── Stratum map (head / torso / tail) ────────────────────────────────────
+    stratum_map = {}
+    if 'stratum' in df_c.columns:
+        stratum_map = (
+            df_c.groupby('contextualQuery')['stratum']
+            .first()
+            .str.lower()
+            .to_dict()
+        )
+        print(f"  Stratum distribution: { {k: sum(1 for v in stratum_map.values() if v==k) for k in ['head','torso','tail']} }")
+    else:
+        print("  ⚠️  No 'stratum' column found — segment info unavailable")
 
     # ── Per-query stats ────────────────────────────────────────────────────────
     print("\nComputing per-query statistics...")
@@ -170,6 +243,7 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
         query_stats[query] = {
             "ctrl_labels": ctrl_lbl, "var_labels": var_lbl,
             "category": category, "cleanQuery": clean_query(query),
+            "stratum": stratum_map.get(query, "unknown"),
         }
 
     cat_counts = {k: sum(1 for v in query_stats.values() if v["category"] == k)
@@ -215,9 +289,26 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
             var_cnt  = query_stats[q]["var_labels"][label]
             diff     = var_cnt - ctrl_cnt
             rows.append({"query": query_stats[q]["cleanQuery"], "rawQuery": q,
-                         "control": ctrl_cnt, "variant": var_cnt, "difference": diff})
+                         "control": ctrl_cnt, "variant": var_cnt, "difference": diff,
+                         "stratum": query_stats[q].get("stratum", "unknown")})
         rows.sort(key=lambda r: r["difference"], reverse=True)
         label_query_tables[label] = rows
+
+    # ── Per-stratum significant-change breakdown ───────────────────────────────
+    STRATA = ["head", "torso", "tail"]
+    stratum_breakdown = {}
+    for seg in STRATA:
+        seg_queries = [q for q in queries_list if query_stats[q].get("stratum") == seg]
+        seg_sig     = [q for q in seg_queries if query_stats[q]["category"] == "significant_change"]
+        seg_ident   = [q for q in seg_queries if query_stats[q]["category"] == "identical"]
+        seg_diff    = [q for q in seg_queries if query_stats[q]["category"] == "diff_same_labels"]
+        stratum_breakdown[seg] = {
+            "total": len(seg_queries),
+            "significant_change": len(seg_sig),
+            "identical": len(seg_ident),
+            "diff_same_labels": len(seg_diff),
+        }
+        print(f"  {seg:6s}: {len(seg_queries):3d} queries  |  sig_change={len(seg_sig)}  identical={len(seg_ident)}  diff_same={len(seg_diff)}")
 
     # ── Item data per query ────────────────────────────────────────────────────
     print("Building item grid data...")
@@ -292,16 +383,16 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
             "good": direction_good, "color": LABEL_COLOR[label],
         })
 
-    ttest_json         = json.dumps(ttest)
-    label_totals_json  = json.dumps({str(k): v for k, v in label_totals.items()})
-    distribution_json  = json.dumps(distribution_data)
-    label_tables_json  = json.dumps({str(k): v for k, v in label_query_tables.items()})
-    query_items_json   = json.dumps(query_items)
-    sig_sections_json  = json.dumps(sig_sections_info)
+    ttest_json             = json.dumps(ttest)
+    label_totals_json      = json.dumps({str(k): v for k, v in label_totals.items()})
+    distribution_json      = json.dumps(distribution_data)
+    label_tables_json      = json.dumps({str(k): v for k, v in label_query_tables.items()})
+    query_items_json       = json.dumps(query_items)
+    sig_sections_json      = json.dumps(sig_sections_info)
+    stratum_breakdown_json = json.dumps(stratum_breakdown)
 
     # ── HTML ───────────────────────────────────────────────────────────────────
     print("Generating HTML...")
-    has_sunlight = all(c in df_c.columns for c in ['stores', 'state', 'zipcode'])
     sig_label_list = ', '.join(f'{l}★' for l in sig_labels) if sig_labels else 'None'
 
     html = f"""<!DOCTYPE html>
@@ -421,6 +512,43 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
   .close-btn {{ float:right; background:none; border:none; font-size:20px;
                 cursor:pointer; color:#6b7280; line-height:1; }}
   .close-btn:hover {{ color:#1a202c; }}
+
+  /* Stratum badges */
+  .stratum-badge {{ display:inline-block; padding:2px 8px; border-radius:10px;
+                    font-size:11px; font-weight:700; letter-spacing:.3px;
+                    text-transform:uppercase; white-space:nowrap; }}
+  .stratum-head  {{ background:#dbeafe; color:#1e40af; border:1px solid #93c5fd; }}
+  .stratum-torso {{ background:#fef3c7; color:#92400e; border:1px solid #fcd34d; }}
+  .stratum-tail  {{ background:#f3f4f6; color:#4b5563; border:1px solid #d1d5db; }}
+  .stratum-unknown {{ background:#f3f4f6; color:#9ca3af; border:1px solid #e5e7eb; }}
+
+  /* Segment filter bar */
+  .seg-filter-bar {{ display:flex; gap:8px; margin-bottom:12px; align-items:center; }}
+  .seg-filter-bar span {{ font-size:12px; color:#6b7280; font-weight:600; }}
+  .seg-btn {{ padding:4px 14px; border-radius:20px; border:1px solid #d1d5db;
+              cursor:pointer; font-size:12px; font-weight:600; background:white;
+              color:#374151; transition:all .15s; }}
+  .seg-btn.active {{ color:white; border-color:transparent; }}
+  .seg-btn[data-seg="all"].active   {{ background:#1e3a8a; }}
+  .seg-btn[data-seg="head"].active  {{ background:#1e40af; }}
+  .seg-btn[data-seg="torso"].active {{ background:#b45309; }}
+  .seg-btn[data-seg="tail"].active  {{ background:#4b5563; }}
+
+  /* Segment breakdown card */
+  .seg-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin-top:4px; }}
+  .seg-card {{ border-radius:10px; padding:16px 18px; border:2px solid; }}
+  .seg-card.head  {{ background:#eff6ff; border-color:#93c5fd; }}
+  .seg-card.torso {{ background:#fffbeb; border-color:#fcd34d; }}
+  .seg-card.tail  {{ background:#f9fafb; border-color:#d1d5db; }}
+  .seg-card-title {{ font-size:13px; font-weight:700; text-transform:uppercase;
+                     letter-spacing:.5px; margin-bottom:10px; }}
+  .seg-card.head  .seg-card-title {{ color:#1e40af; }}
+  .seg-card.torso .seg-card-title {{ color:#92400e; }}
+  .seg-card.tail  .seg-card-title {{ color:#4b5563; }}
+  .seg-stat-row {{ display:flex; justify-content:space-between; font-size:13px;
+                   padding:3px 0; border-bottom:1px solid rgba(0,0,0,.06); }}
+  .seg-stat-row:last-child {{ border-bottom:none; }}
+  .seg-stat-val {{ font-weight:700; color:#1a202c; }}
 </style>
 </head>
 <body>
@@ -482,6 +610,12 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
   </table>
 </div>
 
+<!-- SEGMENT BREAKDOWN -->
+<div class="card">
+  <h2>🏷️ Query Segment Breakdown (Head / Torso / Tail)</h2>
+  <div class="seg-grid" id="seg-grid"></div>
+</div>
+
 <!-- SIGNIFICANT CHANGE SECTIONS -->
 <div class="card"><h2>📈 Significant Label Changes</h2>
   <div id="sig-sections-container"></div>
@@ -503,13 +637,16 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
 </div><!-- /container -->
 
 <script>
-const DISTRIBUTION  = {distribution_json};
-const TTEST         = {ttest_json};
-const LABEL_TOTALS  = {label_totals_json};
-const LABEL_TABLES  = {label_tables_json};
-const QUERY_ITEMS   = {query_items_json};
-const SIG_SECTIONS  = {sig_sections_json};
-const HAS_SUNLIGHT  = {'true' if has_sunlight else 'false'};
+const DISTRIBUTION       = {distribution_json};
+const TTEST              = {ttest_json};
+const LABEL_TOTALS       = {label_totals_json};
+const LABEL_TABLES       = {label_tables_json};
+const QUERY_ITEMS        = {query_items_json};
+const SIG_SECTIONS       = {sig_sections_json};
+const STRATUM_BREAKDOWN  = {stratum_breakdown_json};
+const HAS_DUAL_PRESO     = {'true' if has_dual_preso else 'false'};
+const VARIANT_PTSS       = {json.dumps(variant_ptss)};
+const VARIANT_TRSP       = {json.dumps(variant_trsp)};
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 function diffClassLabel(d, label) {{
@@ -535,14 +672,51 @@ function highlightTitle(title, query) {{
   return result;
 }}
 
-function buildSunlightUrl(item, cleanQuery) {{
-  if (!HAS_SUNLIGHT || !item.stores) return null;
+function buildDualPresoUrl(item, cleanQuery) {{
+  if (!HAS_DUAL_PRESO || !item.stores) return null;
+  const PRESO = 'http://preso-usgm-wcnp.prod.walmart.com/v2/search';
+  const HEADERS = JSON.stringify({{"tenant-id": "elh9ie", "accept-language": "en-US"}});
+  const base = PRESO + '?prg=desktop&stores=' + item.stores
+    + '&stateOrProvinceCode=' + item.state + '&zipcode=' + item.zipcode;
+  const varUrl = base
+    + (VARIANT_PTSS ? '&ptss=' + VARIANT_PTSS : '')
+    + (VARIANT_TRSP ? '&trsp=' + VARIANT_TRSP : '');
   const q = cleanQuery.trim().replace(/\\s+/g, '+');
-  const ep = 'preso-usgm-wcnp.prod.walmart.com/v1/search?prg=desktop'
-    + '&stores=' + item.stores + '&stateOrProvinceCode=' + item.state + '&zipcode=' + item.zipcode;
-  return 'https://sunlight.walmart.com/debugReport?q=' + q
-    + '&cat_id=&endpoint=' + encodeURIComponent(ep)
-    + '&items_affStack1_SBE_EMM=' + item.item_id;
+  return 'https://sunlight.walmart.com/dual_preso_view'
+    + '?eng_a=' + encodeURIComponent(base)
+    + '&headers_a=' + encodeURIComponent(HEADERS)
+    + '&eng_b=' + encodeURIComponent(varUrl)
+    + '&headers_b=' + encodeURIComponent(HEADERS)
+    + '&query=' + q
+    + '&page=1';
+}}
+
+// ── Stratum badge helper ───────────────────────────────────────────────────
+function stratumBadge(s) {{
+  const cls = s ? 'stratum-' + s.toLowerCase() : 'stratum-unknown';
+  return `<span class="stratum-badge ${{cls}}">${{s || '?'}}</span>`;
+}}
+
+// ── Segment breakdown card ─────────────────────────────────────────────────
+function renderSegmentBreakdown() {{
+  const cfg = {{
+    head:  {{label:'Head',  cls:'head',  emoji:'🔵'}},
+    torso: {{label:'Torso', cls:'torso', emoji:'🟡'}},
+    tail:  {{label:'Tail',  cls:'tail',  emoji:'⚪'}},
+  }};
+  document.getElementById('seg-grid').innerHTML = ['head','torso','tail'].map(seg => {{
+    const d = STRATUM_BREAKDOWN[seg] || {{total:0,significant_change:0,identical:0,diff_same_labels:0}};
+    const sigPct = d.total ? Math.round(d.significant_change/d.total*100) : 0;
+    const c = cfg[seg];
+    return `
+      <div class="seg-card ${{c.cls}}">
+        <div class="seg-card-title">${{c.emoji}} ${{c.label}} Queries</div>
+        <div class="seg-stat-row"><span>Total</span><span class="seg-stat-val">${{d.total}}</span></div>
+        <div class="seg-stat-row"><span>Significant change</span><span class="seg-stat-val">${{d.significant_change}} (${{sigPct}}%)</span></div>
+        <div class="seg-stat-row"><span>Identical</span><span class="seg-stat-val">${{d.identical}}</span></div>
+        <div class="seg-stat-row"><span>Diff same labels</span><span class="seg-stat-val">${{d.diff_same_labels}}</span></div>
+      </div>`;
+  }}).join('');
 }}
 
 // ── T-test table ───────────────────────────────────────────────────────────
@@ -583,6 +757,7 @@ function renderDistribution() {{
 
 // ── Significant sections ───────────────────────────────────────────────────
 let activeSigTab = {{}};
+let activeSigSeg = {{}};
 let activeRow = null;
 
 function renderSigSections() {{
@@ -593,6 +768,7 @@ function renderSigSections() {{
   }}
   container.innerHTML = SIG_SECTIONS.map(s => {{
     activeSigTab[s.label] = 'top';
+    activeSigSeg[s.label] = 'all';
     const verdict = s.good
       ? '<span style="color:#10b981;font-weight:600">✅ Good for quality</span>'
       : '<span style="color:#ef4444;font-weight:600">⚠️ Needs attention</span>';
@@ -605,15 +781,25 @@ function renderSigSections() {{
             <div class="sig-info">p = ${{s.p_value.toFixed(6)}} &nbsp;|&nbsp; Control avg: ${{s.ctrl_mean.toFixed(2)}} → Variant avg: ${{s.var_mean.toFixed(2)}} (${{s.diff > 0 ? '+' : ''}}${{s.diff.toFixed(2)}})</div>
           </div>
         </div>
-        <div class="sig-tabs">
-          <button class="sig-tab active" onclick="switchTab(${{s.label}},'top',this)">Top driving queries</button>
-          <button class="sig-tab" onclick="switchTab(${{s.label}},'counter',this)">Counteracting queries</button>
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+          <div class="sig-tabs" style="margin:0">
+            <button class="sig-tab active" onclick="switchTab(${{s.label}},'top',this)">Top driving queries</button>
+            <button class="sig-tab" onclick="switchTab(${{s.label}},'counter',this)">Counteracting queries</button>
+          </div>
+          <div class="seg-filter-bar" style="margin:0">
+            <span>Segment:</span>
+            <button class="seg-btn active" data-seg="all"  onclick="switchSeg(${{s.label}},'all',this)">All</button>
+            <button class="seg-btn"        data-seg="head" onclick="switchSeg(${{s.label}},'head',this)">🔵 Head</button>
+            <button class="seg-btn"        data-seg="torso" onclick="switchSeg(${{s.label}},'torso',this)">🟡 Torso</button>
+            <button class="seg-btn"        data-seg="tail" onclick="switchSeg(${{s.label}},'tail',this)">⚪ Tail</button>
+          </div>
         </div>
         <div class="query-table-wrap">
           <table>
-            <thead><tr><th>Query</th><th style="text-align:right;width:100px">Control</th>
-              <th style="text-align:right;width:100px">Variant</th>
-              <th style="text-align:right;width:100px">Difference</th></tr></thead>
+            <thead><tr><th>Query</th><th style="width:90px">Segment</th>
+              <th style="text-align:right;width:90px">Control</th>
+              <th style="text-align:right;width:90px">Variant</th>
+              <th style="text-align:right;width:90px">Difference</th></tr></thead>
             <tbody id="sig-tbody-${{s.label}}"></tbody>
           </table>
         </div>
@@ -629,10 +815,22 @@ function switchTab(label, mode, btn) {{
   renderSigTable(label);
 }}
 
+function switchSeg(label, seg, btn) {{
+  activeSigSeg[label] = seg;
+  document.getElementById('sig-section-' + label).querySelectorAll('.seg-btn').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  renderSigTable(label);
+}}
+
 function renderSigTable(label) {{
   const tbody = document.getElementById('sig-tbody-' + label);
   let rows = LABEL_TABLES[String(label)] || [];
   const overall = SIG_SECTIONS.find(s => s.label === label).diff;
+  const seg = activeSigSeg[label] || 'all';
+
+  // Filter by segment
+  if (seg !== 'all') rows = rows.filter(r => r.stratum === seg);
+
   let display;
   if (activeSigTab[label] === 'top') {{
     display = overall > 0 ? rows.filter(r => r.difference > 0).slice(0,20)
@@ -641,10 +839,11 @@ function renderSigTable(label) {{
     display = overall > 0 ? rows.filter(r => r.difference < 0).slice(-20).reverse()
                           : rows.filter(r => r.difference > 0).slice(0,20);
   }}
-  if (!display.length) {{ tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#9ca3af;padding:20px">No queries in this category</td></tr>'; return; }}
+  if (!display.length) {{ tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#9ca3af;padding:20px">No queries in this category</td></tr>'; return; }}
   tbody.innerHTML = display.map(r => `
     <tr onclick="showItemGrid('${{r.rawQuery.replace(/'/g,"\\\\'")}}','${{r.query.replace(/'/g,"\\\\'")}}',this)">
-      <td style="max-width:400px;word-break:break-word">${{r.query}}</td>
+      <td style="max-width:360px;word-break:break-word">${{r.query}}</td>
+      <td>${{stratumBadge(r.stratum)}}</td>
       <td style="text-align:right">${{r.control}}</td>
       <td style="text-align:right">${{r.variant}}</td>
       <td style="text-align:right" class="${{diffClassLabel(r.difference,label)}}">${{diffText(r.difference)}}</td>
@@ -658,9 +857,9 @@ function renderItemCard(item, cleanQuery) {{
     : `<div class="item-img-placeholder">No image</div>`;
   const titleHtml = highlightTitle(item.title, cleanQuery);
   const borderCol = item.status === 'var_only' ? '#10b981' : '#ef4444';
-  const sunUrl = buildSunlightUrl(item, cleanQuery);
-  const clickAttr = sunUrl ? `onclick="window.open('${{sunUrl}}','_blank')" style="border-color:${{borderCol}};cursor:pointer;" title="Open in Sunlight"` : `style="border-color:${{borderCol}};"`;
-  const sunBadge = sunUrl ? `<span style="font-size:11px;background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:4px;padding:1px 7px;white-space:nowrap">🔗 Sunlight</span>` : '';
+  const dualUrl = buildDualPresoUrl(item, cleanQuery);
+  const clickAttr = dualUrl ? `onclick="window.open('${{dualUrl}}','_blank')" style="border-color:${{borderCol}};cursor:pointer;" title="Open Dual Preso view"` : `style="border-color:${{borderCol}};"`;
+  const sunBadge = dualUrl ? `<span style="font-size:11px;background:#f0fdf4;color:#166534;border:1px solid #86efac;border-radius:4px;padding:1px 7px;white-space:nowrap">⚡ Dual Preso</span>` : '';
   return `
     <div class="item-card" ${{clickAttr}}>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
@@ -759,6 +958,7 @@ function closeItemPanel() {{
 // Boot
 renderTtestTable();
 renderDistribution();
+renderSegmentBreakdown();
 renderSigSections();
 </script>
 </body>
@@ -788,10 +988,11 @@ def main():
     # Resolve parquet
     if args.local_parquet:
         parquet_path = args.local_parquet
+        resolved_subfolder = args.subfolder or ""
         print(f"\nUsing local parquet: {parquet_path}")
     else:
         print(f"\nResolving parquet from GCS...")
-        parquet_path = resolve_parquet(
+        parquet_path, resolved_subfolder = resolve_parquet(
             gcs_path, args.subfolder, args.cache_dir, experiment_id
         )
 
@@ -799,7 +1000,7 @@ def main():
     output_path = args.output or f"reports/{experiment_id}_recall_dashboard.html"
 
     # Build dashboard
-    build_dashboard(parquet_path, output_path, experiment_id, gcs_path)
+    build_dashboard(parquet_path, output_path, experiment_id, gcs_path, resolved_subfolder)
     return 0
 
 
