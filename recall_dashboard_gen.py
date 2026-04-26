@@ -493,8 +493,6 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
         ctrl_all_c['_key'] = list(zip(ctrl_all_c['contextualQuery'], ctrl_all_c['pg_prod_id']))
 
         # Stable items: promoted to stack 1 (not in ctrl primary, IS in var primary)
-        stable_promoted = stable_recall - ctrl_primary_set & var_primary_set
-        # Fix precedence: need (stable_recall - ctrl_primary_set) & var_primary_set
         stable_promoted = (stable_recall - ctrl_primary_set) & var_primary_set
         # Stable items: demoted from stack 1 (in ctrl primary, NOT in var primary)
         stable_demoted = (stable_recall & ctrl_primary_set) - var_primary_set
@@ -581,7 +579,6 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
         # ── Aggregate per-query tables ──
         def _agg_queries(src_df, top_n=300, include_labels=True):
             """Aggregate query-level stats for a dataframe."""
-            agg_dict = {'pg_prod_id': 'count', 'position': 'mean'}
             if include_labels:
                 result = src_df.groupby('contextualQuery').agg(
                     count=('pg_prod_id', 'count'),
