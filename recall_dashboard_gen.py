@@ -16,11 +16,15 @@ The script:
   3. Filters to impacted=True rows.
   4. Runs paired t-tests per label (1★–4★).
   5. Categorises queries: identical / diff-same-labels / significant-change.
-  6. Generates a single self-contained HTML dashboard with:
+  6. Analyses EM Classifier precision & recall using the stack column:
+     - Precision issues: non-4 items new to variant recall that entered primary stack (stack 1)
+     - Recall issues: label-4 items new to variant recall blocked from primary stack
+  7. Generates a single self-contained HTML dashboard with:
      - Statistical significance table
      - Query distribution breakdown
      - Per-label significant-change tables (top driving + counteracting tabs)
      - Per-query item grid grouped by label section (Good/Bad/Concern signal)
+     - EM Classifier Analysis tab (precision failures + recall failures)
      - Dual Preso deep-links on every item card (control vs variant side-by-side)
 """
 
@@ -391,9 +395,301 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
     sig_sections_json      = json.dumps(sig_sections_info)
     stratum_breakdown_json = json.dumps(stratum_breakdown)
 
+    # ── EM Classifier Analysis (stack-based) ─────────────────────────────────
+    # Uses the FULL dataframe (not impacted-only) since stack analysis needs
+    # complete recall sets to identify what's new vs what moved between stacks.
+    print("\nComputing EM Classifier analysis...")
+    has_stack = 'stack' in df.columns
+    em_stats = {}
+    em_precision_queries = []
+    em_precision_items = []
+    em_recall_queries = []
+    em_recall_items = []
+    em_improvement_queries = []  # precision improvements (non-4s removed)
+    em_improvement_items = []
+    em_recall_improvement_queries = []  # recall improvements (4s added to primary)
+    em_recall_improvement_items = []
+    thresh_prec_loss_queries = []   # threshold: non-4s promoted (bad)
+    thresh_prec_loss_items = []
+    thresh_rec_gain_queries = []    # threshold: 4s promoted (good)
+    thresh_rec_gain_items = []
+    thresh_prec_gain_queries = []   # threshold: non-4s demoted (good)
+    thresh_prec_gain_items = []
+    thresh_rec_loss_queries = []    # threshold: 4s demoted (bad)
+    thresh_rec_loss_items = []
+
+    if has_stack:
+        ctrl_all = df[df['engine'] == CONTROL_ENGINE]
+        var_all  = df[df['engine'] == VARIANT_ENGINE]
+
+        # Build recall sets (all stacks) and primary stack sets (stack 1)
+        ctrl_recall_set  = set(zip(ctrl_all['contextualQuery'], ctrl_all['pg_prod_id']))
+        var_recall_set   = set(zip(var_all['contextualQuery'], var_all['pg_prod_id']))
+        ctrl_primary     = ctrl_all[ctrl_all['stack'] == 1]
+        var_primary      = var_all[var_all['stack'] == 1]
+        ctrl_primary_set = set(zip(ctrl_primary['contextualQuery'], ctrl_primary['pg_prod_id']))
+        var_primary_set  = set(zip(var_primary['contextualQuery'], var_primary['pg_prod_id']))
+
+        # ── Baseline metrics: primary stack precision & recall per engine ──
+        ctrl_primary_total = len(ctrl_primary)
+        ctrl_primary_4s    = int((ctrl_primary['label'] == 4).sum())
+        ctrl_primary_non4s = ctrl_primary_total - ctrl_primary_4s
+        ctrl_recall_4s     = int((ctrl_all['label'] == 4).sum())
+        ctrl_primary_prec  = round(ctrl_primary_non4s / ctrl_primary_total * 100, 2) if ctrl_primary_total else 0
+        ctrl_primary_rec   = round(ctrl_primary_4s / ctrl_recall_4s * 100, 2) if ctrl_recall_4s else 0
+
+        var_primary_total  = len(var_primary)
+        var_primary_4s     = int((var_primary['label'] == 4).sum())
+        var_primary_non4s  = var_primary_total - var_primary_4s
+        var_recall_4s      = int((var_all['label'] == 4).sum())
+        var_primary_prec   = round(var_primary_non4s / var_primary_total * 100, 2) if var_primary_total else 0
+        var_primary_rec    = round(var_primary_4s / var_recall_4s * 100, 2) if var_recall_4s else 0
+
+        print(f"  Control primary stack: {ctrl_primary_total:,} items, {ctrl_primary_non4s:,} non-4 ({ctrl_primary_prec}%), recall of 4s: {ctrl_primary_rec}%")
+        print(f"  Variant primary stack: {var_primary_total:,} items, {var_primary_non4s:,} non-4 ({var_primary_prec}%), recall of 4s: {var_primary_rec}%")
+
+        # ── Delta analysis: what's NEW between engines ──
+        new_to_var_recall  = var_recall_set - ctrl_recall_set   # new items variant retrieved
+        lost_from_recall   = ctrl_recall_set - var_recall_set   # items variant dropped
+
+        # Tag keys for efficient lookup
+        vp_df = var_primary.copy()
+        vp_df['_key'] = list(zip(vp_df['contextualQuery'], vp_df['pg_prod_id']))
+        var_all_c = var_all.copy()
+        var_all_c['_key'] = list(zip(var_all_c['contextualQuery'], var_all_c['pg_prod_id']))
+        ctrl_primary_c = ctrl_primary.copy()
+        ctrl_primary_c['_key'] = list(zip(ctrl_primary_c['contextualQuery'], ctrl_primary_c['pg_prod_id']))
+
+        # 1) NEW PRECISION FAILURES: new to recall + in primary stack + label != 4
+        new_in_primary = new_to_var_recall & var_primary_set
+        pi_df = vp_df[vp_df['_key'].isin(new_in_primary) & (vp_df['label'] != 4)].drop(columns=['_key'])
+
+        # 2) NEW RECALL FAILURES: new to recall + label=4 + NOT in primary stack
+        new_recall_4s = var_all_c[var_all_c['_key'].isin(new_to_var_recall) & (var_all_c['label'] == 4)]
+        ri_keys = set(zip(new_recall_4s['contextualQuery'], new_recall_4s['pg_prod_id'])) - var_primary_set
+        ri_df = new_recall_4s[new_recall_4s['_key'].isin(ri_keys)].drop(columns=['_key'])
+
+        # 3) NEW PRECISION IMPROVEMENTS: non-4s that were in control recall (and
+        #    by extension primary stack) but removed from variant recall entirely
+        pimprv_df = ctrl_primary_c[
+            ctrl_primary_c['_key'].isin(lost_from_recall) & (ctrl_primary_c['label'] != 4)
+        ].drop(columns=['_key'])
+
+        # 4) NEW RECALL IMPROVEMENTS: 4s new to variant recall AND in primary stack
+        new_4s_in_primary = new_to_var_recall & var_primary_set
+        rimprv_df = vp_df[vp_df['_key'].isin(new_4s_in_primary) & (vp_df['label'] == 4)].drop(columns=['_key'])
+
+        print(f"  New precision failures  (non-4 new→primary):       {len(pi_df):,} across {pi_df['contextualQuery'].nunique()} queries")
+        print(f"  New precision improvements (non-4 ctrl→removed):   {len(pimprv_df):,} across {pimprv_df['contextualQuery'].nunique()} queries")
+        print(f"  New recall failures (4s new→blocked):              {len(ri_df):,} across {ri_df['contextualQuery'].nunique()} queries")
+        print(f"  New recall improvements (4s new→primary):          {len(rimprv_df):,} across {rimprv_df['contextualQuery'].nunique()} queries")
+
+        # ── 5) STABLE RECALL: EM threshold effects on items in BOTH recall sets ──
+        # Items that exist in both control and variant recall but changed stack
+        stable_recall = ctrl_recall_set & var_recall_set
+
+        # Also tag ctrl_all for lookup
+        ctrl_all_c = ctrl_all.copy()
+        ctrl_all_c['_key'] = list(zip(ctrl_all_c['contextualQuery'], ctrl_all_c['pg_prod_id']))
+
+        # Stable items: promoted to stack 1 (not in ctrl primary, IS in var primary)
+        stable_promoted = (stable_recall - ctrl_primary_set) & var_primary_set
+        # Stable items: demoted from stack 1 (in ctrl primary, NOT in var primary)
+        stable_demoted = (stable_recall & ctrl_primary_set) - var_primary_set
+
+        # 5a) Threshold precision loss: stable + promoted + label != 4
+        thresh_prec_loss_df = vp_df[vp_df['_key'].isin(stable_promoted) & (vp_df['label'] != 4)].drop(columns=['_key'])
+        # 5b) Threshold recall gain: stable + promoted + label == 4
+        thresh_rec_gain_df = vp_df[vp_df['_key'].isin(stable_promoted) & (vp_df['label'] == 4)].drop(columns=['_key'])
+        # 5c) Threshold precision gain: stable + demoted + label != 4
+        thresh_prec_gain_df = ctrl_primary_c[ctrl_primary_c['_key'].isin(stable_demoted) & (ctrl_primary_c['label'] != 4)].drop(columns=['_key'])
+        # 5d) Threshold recall loss: stable + demoted + label == 4
+        thresh_rec_loss_df = ctrl_primary_c[ctrl_primary_c['_key'].isin(stable_demoted) & (ctrl_primary_c['label'] == 4)].drop(columns=['_key'])
+
+        thresh_net_prec = len(thresh_prec_gain_df) - len(thresh_prec_loss_df)
+        thresh_net_rec  = len(thresh_rec_gain_df)  - len(thresh_rec_loss_df)
+
+        print(f"\n  Stable recall (threshold effects):")
+        print(f"    Items in both recall sets:      {len(stable_recall):,}")
+        print(f"    Promoted to primary (non-4):    {len(thresh_prec_loss_df):,}  ← precision loss")
+        print(f"    Promoted to primary (4s):       {len(thresh_rec_gain_df):,}  ← recall gain")
+        print(f"    Demoted from primary (non-4):   {len(thresh_prec_gain_df):,}  ← precision gain")
+        print(f"    Demoted from primary (4s):      {len(thresh_rec_loss_df):,}  ← recall loss")
+        print(f"    Net threshold precision: {thresh_net_prec:+,}  |  Net threshold recall: {thresh_net_rec:+,}")
+
+        # ── Net metrics ──
+        net_precision = len(pimprv_df) - len(pi_df)   # positive = better
+        net_recall    = len(rimprv_df) - len(ri_df)    # positive = better
+
+        em_stats = {
+            # Baseline comparison
+            "ctrl_primary_total": ctrl_primary_total,
+            "ctrl_primary_non4": ctrl_primary_non4s,
+            "ctrl_primary_prec": ctrl_primary_prec,
+            "ctrl_primary_4s": ctrl_primary_4s,
+            "ctrl_recall_4s": ctrl_recall_4s,
+            "ctrl_primary_rec": ctrl_primary_rec,
+            "var_primary_total": var_primary_total,
+            "var_primary_non4": var_primary_non4s,
+            "var_primary_prec": var_primary_prec,
+            "var_primary_4s": var_primary_4s,
+            "var_recall_4s": var_recall_4s,
+            "var_primary_rec": var_primary_rec,
+            # New failures
+            "precision_total": int(len(pi_df)),
+            "precision_queries": int(pi_df['contextualQuery'].nunique()),
+            "precision_label_1": int((pi_df['label'] == 1).sum()),
+            "precision_label_2": int((pi_df['label'] == 2).sum()),
+            "precision_label_3": int((pi_df['label'] == 3).sum()),
+            "precision_in_top20": int((pi_df['position'] <= 20).sum()),
+            "precision_in_top10": int((pi_df['position'] <= 10).sum()),
+            "precision_mean_pos": round(float(pi_df['position'].mean()), 1) if len(pi_df) else 0,
+            "recall_total": int(len(ri_df)),
+            "recall_queries": int(ri_df['contextualQuery'].nunique()),
+            # New improvements
+            "prec_improvement_total": int(len(pimprv_df)),
+            "prec_improvement_queries": int(pimprv_df['contextualQuery'].nunique()),
+            "prec_improvement_label_1": int((pimprv_df['label'] == 1).sum()),
+            "prec_improvement_label_2": int((pimprv_df['label'] == 2).sum()),
+            "prec_improvement_label_3": int((pimprv_df['label'] == 3).sum()),
+            "recall_improvement_total": int(len(rimprv_df)),
+            "recall_improvement_queries": int(rimprv_df['contextualQuery'].nunique()),
+            # Net
+            "net_precision": net_precision,
+            "net_recall": net_recall,
+            "new_to_recall_total": int(len(new_to_var_recall)),
+            "lost_from_recall_total": int(len(lost_from_recall)),
+            # Threshold effects (stable recall)
+            "stable_recall_total": int(len(stable_recall)),
+            "thresh_prec_loss": int(len(thresh_prec_loss_df)),
+            "thresh_prec_loss_queries": int(thresh_prec_loss_df['contextualQuery'].nunique()) if len(thresh_prec_loss_df) else 0,
+            "thresh_prec_loss_l1": int((thresh_prec_loss_df['label'] == 1).sum()) if len(thresh_prec_loss_df) else 0,
+            "thresh_prec_loss_l2": int((thresh_prec_loss_df['label'] == 2).sum()) if len(thresh_prec_loss_df) else 0,
+            "thresh_prec_loss_l3": int((thresh_prec_loss_df['label'] == 3).sum()) if len(thresh_prec_loss_df) else 0,
+            "thresh_rec_gain": int(len(thresh_rec_gain_df)),
+            "thresh_rec_gain_queries": int(thresh_rec_gain_df['contextualQuery'].nunique()) if len(thresh_rec_gain_df) else 0,
+            "thresh_prec_gain": int(len(thresh_prec_gain_df)),
+            "thresh_prec_gain_queries": int(thresh_prec_gain_df['contextualQuery'].nunique()) if len(thresh_prec_gain_df) else 0,
+            "thresh_rec_loss": int(len(thresh_rec_loss_df)),
+            "thresh_rec_loss_queries": int(thresh_rec_loss_df['contextualQuery'].nunique()) if len(thresh_rec_loss_df) else 0,
+            "thresh_net_prec": thresh_net_prec,
+            "thresh_net_rec": thresh_net_rec,
+        }
+
+        # ── Aggregate per-query tables ──
+        def _agg_queries(src_df, top_n=300, include_labels=True):
+            """Aggregate query-level stats for a dataframe."""
+            if include_labels:
+                result = src_df.groupby('contextualQuery').agg(
+                    count=('pg_prod_id', 'count'),
+                    label_1=('label', lambda x: int((x == 1).sum())),
+                    label_2=('label', lambda x: int((x == 2).sum())),
+                    label_3=('label', lambda x: int((x == 3).sum())),
+                    avg_pos=('position', 'mean'),
+                    top20=('position', lambda x: int((x <= 20).sum())),
+                ).sort_values('count', ascending=False).head(top_n)
+            else:
+                result = src_df.groupby('contextualQuery').agg(
+                    count=('pg_prod_id', 'count'),
+                    avg_pos=('position', 'mean'),
+                ).sort_values('count', ascending=False).head(top_n)
+            rows = []
+            for q, row in result.iterrows():
+                r = {"query": q, "cleanQuery": clean_query(q),
+                     "count": int(row['count']),
+                     "avg_pos": round(row['avg_pos'], 1),
+                     "stratum": stratum_map.get(q, "unknown")}
+                if include_labels:
+                    r.update({"label_1": int(row['label_1']), "label_2": int(row['label_2']),
+                              "label_3": int(row['label_3']), "top20": int(row['top20'])})
+                rows.append(r)
+            return rows
+
+        em_precision_queries     = _agg_queries(pi_df, include_labels=True)
+        em_recall_queries        = _agg_queries(ri_df, include_labels=False)
+        em_improvement_queries   = _agg_queries(pimprv_df, include_labels=True)
+        em_recall_improvement_queries = _agg_queries(rimprv_df, include_labels=False)
+
+        # Threshold effect queries
+        thresh_prec_loss_queries  = _agg_queries(thresh_prec_loss_df, include_labels=True) if len(thresh_prec_loss_df) else []
+        thresh_rec_gain_queries   = _agg_queries(thresh_rec_gain_df, include_labels=False) if len(thresh_rec_gain_df) else []
+        thresh_prec_gain_queries  = _agg_queries(thresh_prec_gain_df, include_labels=True) if len(thresh_prec_gain_df) else []
+        thresh_rec_loss_queries   = _agg_queries(thresh_rec_loss_df, include_labels=False) if len(thresh_rec_loss_df) else []
+
+        # ── Item-level data (top 200 queries per section) ──
+        def _collect_items(src_df, query_list, max_queries=200, include_stack=False):
+            top_qs = set(r['query'] for r in query_list[:max_queries])
+            icols = ['contextualQuery', 'pg_prod_id', 'label', 'position', 'title',
+                     'image', 'l1_category', 'id']
+            if include_stack:
+                icols.append('stack')
+            icols = [c for c in icols if c in src_df.columns]
+            items = []
+            for _, row in src_df[src_df['contextualQuery'].isin(top_qs)][icols].iterrows():
+                item = {
+                    "query": str(row['contextualQuery']),
+                    "pg_prod_id": safe(row.get('pg_prod_id')),
+                    "label": int(row['label']) if not pd.isna(row['label']) else 0,
+                    "position": int(row['position']) if not pd.isna(row['position']) else 0,
+                    "title": safe(row.get('title')),
+                    "image": safe(row.get('image')),
+                    "l1_category": safe(row.get('l1_category')),
+                }
+                if include_stack and 'stack' in row.index:
+                    item["stack"] = int(row['stack']) if not pd.isna(row['stack']) else 0
+                items.append(item)
+            return items
+
+        em_precision_items    = _collect_items(pi_df, em_precision_queries)
+        em_recall_items       = _collect_items(ri_df, em_recall_queries, include_stack=True)
+        em_improvement_items  = _collect_items(pimprv_df, em_improvement_queries)
+        em_recall_improvement_items = _collect_items(rimprv_df, em_recall_improvement_queries)
+
+        # Threshold effect items
+        thresh_prec_loss_items = _collect_items(thresh_prec_loss_df, thresh_prec_loss_queries, include_stack=True) if len(thresh_prec_loss_df) else []
+        thresh_rec_gain_items  = _collect_items(thresh_rec_gain_df, thresh_rec_gain_queries, include_stack=True) if len(thresh_rec_gain_df) else []
+        thresh_prec_gain_items = _collect_items(thresh_prec_gain_df, thresh_prec_gain_queries, include_stack=True) if len(thresh_prec_gain_df) else []
+        thresh_rec_loss_items  = _collect_items(thresh_rec_loss_df, thresh_rec_loss_queries, include_stack=True) if len(thresh_rec_loss_df) else []
+
+        print(f"  Serialized items: prec_fail={len(em_precision_items):,} prec_imprv={len(em_improvement_items):,} "
+              f"recall_fail={len(em_recall_items):,} recall_imprv={len(em_recall_improvement_items):,}")
+        print(f"  Threshold items: prec_loss={len(thresh_prec_loss_items):,} rec_gain={len(thresh_rec_gain_items):,} "
+              f"prec_gain={len(thresh_prec_gain_items):,} rec_loss={len(thresh_rec_loss_items):,}")
+
+        # Category breakdown
+        if 'l1_category' in pi_df.columns:
+            em_stats["precision_by_category"] = pi_df['l1_category'].value_counts().head(10).to_dict()
+        if 'recall_strategy' in pi_df.columns:
+            em_stats["precision_by_strategy"] = pi_df['recall_strategy'].value_counts().to_dict()
+    else:
+        print("  ⚠️  No 'stack' column — EM Classifier tab will be disabled")
+
+    em_stats_json                      = json.dumps(em_stats)
+    em_precision_queries_json          = json.dumps(em_precision_queries)
+    em_precision_items_json            = json.dumps(em_precision_items)
+    em_recall_queries_json             = json.dumps(em_recall_queries)
+    em_recall_items_json               = json.dumps(em_recall_items)
+    em_improvement_queries_json        = json.dumps(em_improvement_queries)
+    em_improvement_items_json          = json.dumps(em_improvement_items)
+    em_recall_improvement_queries_json = json.dumps(em_recall_improvement_queries)
+    em_recall_improvement_items_json   = json.dumps(em_recall_improvement_items)
+    thresh_prec_loss_queries_json  = json.dumps(thresh_prec_loss_queries)
+    thresh_prec_loss_items_json    = json.dumps(thresh_prec_loss_items)
+    thresh_rec_gain_queries_json   = json.dumps(thresh_rec_gain_queries)
+    thresh_rec_gain_items_json     = json.dumps(thresh_rec_gain_items)
+    thresh_prec_gain_queries_json  = json.dumps(thresh_prec_gain_queries)
+    thresh_prec_gain_items_json    = json.dumps(thresh_prec_gain_items)
+    thresh_rec_loss_queries_json   = json.dumps(thresh_rec_loss_queries)
+    thresh_rec_loss_items_json     = json.dumps(thresh_rec_loss_items)
+
     # ── HTML ───────────────────────────────────────────────────────────────────
     print("Generating HTML...")
     sig_label_list = ', '.join(f'{l}★' for l in sig_labels) if sig_labels else 'None'
+    em_tab_label = (
+        f'🔬 EM Classifier Analysis <span class="tab-badge">{em_stats.get("precision_total", 0):,} issues</span>'
+        if has_stack else '🔬 EM Classifier (N/A)'
+    )
+    em_no_stack_msg = '<div class="card"><h2 style="color:#9ca3af">⚠️ No stack column in data — EM Classifier analysis unavailable</h2></div>' if not has_stack else ''
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -549,6 +845,61 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
                    padding:3px 0; border-bottom:1px solid rgba(0,0,0,.06); }}
   .seg-stat-row:last-child {{ border-bottom:none; }}
   .seg-stat-val {{ font-weight:700; color:#1a202c; }}
+
+  /* Top-level tabs */
+  .top-tabs {{ display:flex; gap:4px; margin-bottom:24px; background:#e2e8f0;
+               border-radius:12px; padding:4px; }}
+  .top-tab {{ flex:1; padding:14px 20px; border:none; background:transparent;
+              color:#64748b; font-size:15px; font-weight:600; cursor:pointer;
+              border-radius:8px; transition:all .2s; text-align:center; }}
+  .top-tab:hover {{ background:#cbd5e1; color:#1e293b; }}
+  .top-tab.active {{ background:#1e3a8a; color:white; box-shadow:0 2px 8px rgba(30,58,138,.3); }}
+  .top-tab.active-red {{ background:#dc2626; color:white; box-shadow:0 2px 8px rgba(220,38,38,.3); }}
+  .top-tab-content {{ display:none; }}
+  .top-tab-content.active {{ display:block; }}
+  .top-tab .tab-badge {{ display:inline-block; background:rgba(255,255,255,.25);
+                         padding:1px 8px; border-radius:10px; font-size:12px; margin-left:6px; }}
+
+  /* EM Classifier styles */
+  .em-stats-row {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
+                   gap:12px; margin-bottom:20px; }}
+  .em-stat {{ background:white; border-radius:10px; padding:16px 18px;
+              border-left:4px solid #3b82f6; box-shadow:0 1px 4px rgba(0,0,0,.06); }}
+  .em-stat.red {{ border-left-color:#ef4444; }}
+  .em-stat.amber {{ border-left-color:#f59e0b; }}
+  .em-stat.green {{ border-left-color:#10b981; }}
+  .em-stat .em-lbl {{ font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:.5px; }}
+  .em-stat .em-val {{ font-size:26px; font-weight:700; color:#1e3a8a; margin-top:2px; }}
+  .em-stat .em-sub {{ font-size:11px; color:#94a3b8; margin-top:2px; }}
+  .em-insight {{ background:#fffbeb; border-left:4px solid #f59e0b;
+                 padding:12px 16px; border-radius:0 8px 8px 0; margin:8px 0;
+                 font-size:13px; color:#92400e; }}
+  .em-split {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }}
+  .em-query-list {{ max-height:480px; overflow-y:auto; }}
+  .em-items-panel {{ max-height:480px; overflow-y:auto; }}
+  .em-item-card {{ background:white; border:1px solid #e5e7eb; border-radius:8px;
+                   padding:12px; margin-bottom:8px; display:flex; gap:10px;
+                   align-items:flex-start; transition:all .15s; }}
+  .em-item-card:hover {{ box-shadow:0 2px 8px rgba(0,0,0,.08); }}
+  .em-item-img {{ width:50px; height:50px; border-radius:6px; object-fit:cover;
+                  background:#f3f4f6; flex-shrink:0; }}
+  .em-item-info {{ flex:1; min-width:0; }}
+  .em-item-title {{ font-size:12px; color:#1a202c; white-space:nowrap;
+                    overflow:hidden; text-overflow:ellipsis; margin-bottom:3px; }}
+  .em-item-meta {{ font-size:11px; color:#6b7280; }}
+  .em-item-meta span {{ margin-right:10px; }}
+  .em-filter-row {{ display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap; }}
+  .em-filter-btn {{ padding:5px 12px; border-radius:6px; border:1px solid #d1d5db;
+                    background:white; color:#6b7280; cursor:pointer; font-size:12px;
+                    transition:all .15s; }}
+  .em-filter-btn:hover {{ background:#f1f5f9; color:#1e293b; }}
+  .em-filter-btn.active {{ background:#1e3a8a; border-color:#1e3a8a; color:white; }}
+  .em-chart-bar {{ display:flex; align-items:center; margin:3px 0; font-size:12px; }}
+  .em-chart-label {{ width:130px; color:#6b7280; text-align:right; padding-right:8px;
+                     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+  .em-chart-track {{ flex:1; height:18px; background:#f1f5f9; border-radius:3px; overflow:hidden; }}
+  .em-chart-fill {{ height:100%; border-radius:3px; display:flex; align-items:center;
+                    padding-left:6px; font-size:10px; color:white; font-weight:600; }}
 </style>
 </head>
 <body>
@@ -567,6 +918,15 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
     </div>
   </div>
 </div>
+
+<!-- TOP-LEVEL TABS -->
+<div class="top-tabs">
+  <button class="top-tab active" onclick="switchTopTab('recall')">📊 Recall Analysis</button>
+  <button class="top-tab" onclick="switchTopTab('em')" id="em-tab-btn">{em_tab_label}</button>
+</div>
+
+<!-- ═══ RECALL ANALYSIS TAB ═══ -->
+<div class="top-tab-content active" id="tab-recall">
 
 <!-- T-TEST TABLE -->
 <div class="card">
@@ -634,6 +994,246 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
   <div id="items-grid"></div>
 </div>
 
+</div><!-- /tab-recall -->
+
+<!-- ═══ EM CLASSIFIER ANALYSIS TAB ═══ -->
+<div class="top-tab-content" id="tab-em">
+{em_no_stack_msg}
+
+<!-- BASELINE COMPARISON -->
+<div class="card">
+  <h2>📊 Primary Stack: Control vs Variant Baseline</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:16px;">
+    <div style="background:#eff6ff;border:2px solid #93c5fd;border-radius:12px;padding:20px;">
+      <div style="font-size:14px;font-weight:700;color:#1e40af;margin-bottom:12px;">🔵 Control</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div><div style="font-size:11px;color:#6b7280;text-transform:uppercase">Precision (non-4 rate)</div>
+          <div style="font-size:28px;font-weight:700;color:#1e3a8a" id="em-ctrl-prec"></div></div>
+        <div><div style="font-size:11px;color:#6b7280;text-transform:uppercase">Recall (4s in primary)</div>
+          <div style="font-size:28px;font-weight:700;color:#1e3a8a" id="em-ctrl-rec"></div></div>
+        <div><div style="font-size:11px;color:#6b7280">Primary stack items</div>
+          <div style="font-size:16px;font-weight:600;color:#374151" id="em-ctrl-total"></div></div>
+        <div><div style="font-size:11px;color:#6b7280">4s in recall</div>
+          <div style="font-size:16px;font-weight:600;color:#374151" id="em-ctrl-recall4s"></div></div>
+      </div>
+    </div>
+    <div style="background:#fef2f2;border:2px solid #fca5a5;border-radius:12px;padding:20px;">
+      <div style="font-size:14px;font-weight:700;color:#991b1b;margin-bottom:12px;">🔴 Variant</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div><div style="font-size:11px;color:#6b7280;text-transform:uppercase">Precision (non-4 rate)</div>
+          <div style="font-size:28px;font-weight:700;color:#991b1b" id="em-var-prec"></div></div>
+        <div><div style="font-size:11px;color:#6b7280;text-transform:uppercase">Recall (4s in primary)</div>
+          <div style="font-size:28px;font-weight:700;color:#991b1b" id="em-var-rec"></div></div>
+        <div><div style="font-size:11px;color:#6b7280">Primary stack items</div>
+          <div style="font-size:16px;font-weight:600;color:#374151" id="em-var-total"></div></div>
+        <div><div style="font-size:11px;color:#6b7280">4s in recall</div>
+          <div style="font-size:16px;font-weight:600;color:#374151" id="em-var-recall4s"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- NET VERDICT + DELTA OVERVIEW -->
+<div class="em-stats-row">
+  <div class="em-stat red"><div class="em-lbl">New Precision Failures</div>
+    <div class="em-val" id="em-pi-total"></div>
+    <div class="em-sub">Non-4s new to recall → primary stack</div></div>
+  <div class="em-stat green"><div class="em-lbl">Precision Improvements</div>
+    <div class="em-val" id="em-pimprv-total"></div>
+    <div class="em-sub">Non-4s removed from control recall</div></div>
+  <div class="em-stat" id="em-net-prec-card"><div class="em-lbl">Net Precision</div>
+    <div class="em-val" id="em-net-prec"></div>
+    <div class="em-sub" id="em-net-prec-sub"></div></div>
+  <div class="em-stat amber"><div class="em-lbl">New Recall Failures</div>
+    <div class="em-val" id="em-ri-total"></div>
+    <div class="em-sub">4s new to recall → blocked from primary</div></div>
+  <div class="em-stat green"><div class="em-lbl">Recall Improvements</div>
+    <div class="em-val" id="em-rimprv-total"></div>
+    <div class="em-sub">4s new to recall → promoted to primary</div></div>
+  <div class="em-stat" id="em-net-rec-card"><div class="em-lbl">Net Recall</div>
+    <div class="em-val" id="em-net-rec"></div>
+    <div class="em-sub" id="em-net-rec-sub"></div></div>
+</div>
+
+<div class="em-insight" id="em-insight-1"></div>
+<div class="em-insight" id="em-insight-2"></div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:20px;">
+  <div class="card">
+    <h2>Precision Issues by Label</h2>
+    <div id="em-label-bars"></div>
+  </div>
+  <div class="card">
+    <h2>Top Categories Affected</h2>
+    <div id="em-category-bars"></div>
+  </div>
+</div>
+
+<!-- PRECISION FAILURES SECTION -->
+<div class="card">
+  <h2>🔴 Precision Failures — Non-4s Entering Primary Stack</h2>
+  <p style="color:#6b7280;font-size:13px;margin-bottom:14px;">
+    Items <strong>not in control recall</strong>, newly retrieved by variant, promoted to
+    primary stack (stack&nbsp;1) despite label&nbsp;≠&nbsp;4. The EM classifier should have blocked these.
+  </p>
+  <input type="text" class="search-bar" id="em-pi-search" placeholder="Search queries..."
+         oninput="renderEmPrecisionQueries()" style="width:100%;padding:10px 14px;
+         background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;
+         color:#1a202c;margin-bottom:10px;">
+  <div class="em-filter-row">
+    <button class="em-filter-btn active" onclick="emPiFilter='all';this.parentNode.querySelectorAll('.em-filter-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active');renderEmPrecisionQueries()">All Labels</button>
+    <button class="em-filter-btn" onclick="emPiFilter=1;this.parentNode.querySelectorAll('.em-filter-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active');renderEmPrecisionQueries()">Label 1</button>
+    <button class="em-filter-btn" onclick="emPiFilter=2;this.parentNode.querySelectorAll('.em-filter-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active');renderEmPrecisionQueries()">Label 2</button>
+    <button class="em-filter-btn" onclick="emPiFilter=3;this.parentNode.querySelectorAll('.em-filter-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active');renderEmPrecisionQueries()">Label 3</button>
+    <button class="em-filter-btn" onclick="emPiFilter='top20';this.parentNode.querySelectorAll('.em-filter-btn').forEach(b=>b.classList.remove('active'));this.classList.add('active');renderEmPrecisionQueries()">Top-20 Only</button>
+  </div>
+  <div class="em-split">
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px">Queries (click to explore)</h3>
+      <div class="em-query-list" id="em-pi-query-list"></div></div>
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px" id="em-pi-items-header">Select a query</h3>
+      <div class="em-items-panel" id="em-pi-items-list"></div></div>
+  </div>
+</div>
+
+<!-- PRECISION IMPROVEMENTS SECTION -->
+<div class="card">
+  <h2>🟢 Precision Improvements — Non-4s Removed from Recall</h2>
+  <p style="color:#6b7280;font-size:13px;margin-bottom:14px;">
+    Items rated <strong>non-4</strong> that were in the control primary stack but have been
+    <strong>removed entirely</strong> from variant recall. This is a win — fewer bad items in the stack.
+  </p>
+  <input type="text" class="search-bar" id="em-pimprv-search" placeholder="Search queries..."
+         oninput="renderEmImprovementQueries()" style="width:100%;padding:10px 14px;
+         background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;
+         color:#1a202c;margin-bottom:10px;">
+  <div class="em-split">
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px">Queries (click to explore)</h3>
+      <div class="em-query-list" id="em-pimprv-query-list"></div></div>
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px" id="em-pimprv-items-header">Select a query</h3>
+      <div class="em-items-panel" id="em-pimprv-items-list"></div></div>
+  </div>
+</div>
+
+<!-- RECALL FAILURES SECTION -->
+<div class="card">
+  <h2>🟡 Recall Failures — Label-4 Items Blocked from Primary Stack</h2>
+  <p style="color:#6b7280;font-size:13px;margin-bottom:14px;">
+    Items rated <strong>4★ (excellent)</strong>, newly retrieved by variant, but the EM classifier
+    did <strong>not</strong> promote them to stack&nbsp;1. Stuck in stack&nbsp;2/3.
+  </p>
+  <input type="text" class="search-bar" id="em-ri-search" placeholder="Search queries..."
+         oninput="renderEmRecallQueries()" style="width:100%;padding:10px 14px;
+         background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;
+         color:#1a202c;margin-bottom:10px;">
+  <div class="em-split">
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px">Queries (click to explore)</h3>
+      <div class="em-query-list" id="em-ri-query-list"></div></div>
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px" id="em-ri-items-header">Select a query</h3>
+      <div class="em-items-panel" id="em-ri-items-list"></div></div>
+  </div>
+</div>
+
+<!-- RECALL IMPROVEMENTS SECTION -->
+<div class="card">
+  <h2>🟢 Recall Improvements — 4s New to Recall &amp; Promoted to Primary</h2>
+  <p style="color:#6b7280;font-size:13px;margin-bottom:14px;">
+    Label-4 items <strong>newly retrieved</strong> by variant and successfully
+    <strong>promoted to primary stack</strong>. This is the best outcome — new excellent items surfaced to users.
+  </p>
+  <input type="text" class="search-bar" id="em-rimprv-search" placeholder="Search queries..."
+         oninput="renderEmRecallImprovementQueries()" style="width:100%;padding:10px 14px;
+         background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;
+         color:#1a202c;margin-bottom:10px;">
+  <div class="em-split">
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px">Queries (click to explore)</h3>
+      <div class="em-query-list" id="em-rimprv-query-list"></div></div>
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px" id="em-rimprv-items-header">Select a query</h3>
+      <div class="em-items-panel" id="em-rimprv-items-list"></div></div>
+  </div>
+</div>
+
+<!-- ═══ EM THRESHOLD EFFECTS (STABLE RECALL) ═══ -->
+<div class="card" style="border-top:4px solid #8b5cf6;">
+  <h2>⚡ EM Threshold Effects — Stable Recall Items</h2>
+  <p style="color:#6b7280;font-size:13px;margin-bottom:14px;">
+    Items that exist in <strong>both</strong> control and variant recall sets, but changed primary stack status.
+    These changes are caused by <strong>dynamic threshold shifts</strong> in the EM classifier — when the recall
+    set composition changes, the classifier&rsquo;s decision boundary moves, promoting or demoting items that were always retrievable.
+  </p>
+
+  <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:16px;margin-bottom:20px;align-items:center;">
+    <div style="background:#f5f3ff;border:2px solid #c4b5fd;border-radius:12px;padding:16px;">
+      <div style="font-size:12px;font-weight:700;color:#7c3aed;text-transform:uppercase;margin-bottom:8px">Precision (non-4 stack changes)</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <div style="font-size:11px;color:#ef4444;font-weight:600">🔺 Promoted (bad)</div>
+          <div style="font-size:22px;font-weight:700;color:#ef4444" id="thresh-prec-loss-val"></div>
+          <div style="font-size:11px;color:#6b7280" id="thresh-prec-loss-q"></div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:#10b981;font-weight:600">🔻 Demoted (good)</div>
+          <div style="font-size:22px;font-weight:700;color:#10b981" id="thresh-prec-gain-val"></div>
+          <div style="font-size:11px;color:#6b7280" id="thresh-prec-gain-q"></div>
+        </div>
+      </div>
+    </div>
+    <div style="text-align:center;padding:0 8px;">
+      <div style="font-size:11px;color:#6b7280;text-transform:uppercase;margin-bottom:4px">Stable items</div>
+      <div style="font-size:24px;font-weight:700;color:#7c3aed" id="thresh-stable-total"></div>
+      <div style="font-size:11px;color:#6b7280">in both recall sets</div>
+    </div>
+    <div style="background:#f5f3ff;border:2px solid #c4b5fd;border-radius:12px;padding:16px;">
+      <div style="font-size:12px;font-weight:700;color:#7c3aed;text-transform:uppercase;margin-bottom:8px">Recall (4★ stack changes)</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div>
+          <div style="font-size:11px;color:#10b981;font-weight:600">🔺 Promoted (good)</div>
+          <div style="font-size:22px;font-weight:700;color:#10b981" id="thresh-rec-gain-val"></div>
+          <div style="font-size:11px;color:#6b7280" id="thresh-rec-gain-q"></div>
+        </div>
+        <div>
+          <div style="font-size:11px;color:#ef4444;font-weight:600">🔻 Demoted (bad)</div>
+          <div style="font-size:22px;font-weight:700;color:#ef4444" id="thresh-rec-loss-val"></div>
+          <div style="font-size:11px;color:#6b7280" id="thresh-rec-loss-q"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="em-stats-row">
+    <div class="em-stat" id="thresh-net-prec-card" style="border-left-color:#8b5cf6;">
+      <div class="em-lbl">Net Threshold Precision</div>
+      <div class="em-val" id="thresh-net-prec"></div>
+      <div class="em-sub" id="thresh-net-prec-sub"></div></div>
+    <div class="em-stat" id="thresh-net-rec-card" style="border-left-color:#8b5cf6;">
+      <div class="em-lbl">Net Threshold Recall</div>
+      <div class="em-val" id="thresh-net-rec"></div>
+      <div class="em-sub" id="thresh-net-rec-sub"></div></div>
+  </div>
+
+  <div class="em-insight" id="thresh-insight" style="border-left-color:#8b5cf6;background:#f5f3ff;color:#5b21b6;"></div>
+
+  <!-- Sub-tabs for the 4 threshold buckets -->
+  <div style="display:flex;gap:4px;margin:16px 0 12px;background:#ede9fe;border-radius:8px;padding:3px;" id="thresh-subtabs">
+    <button class="em-filter-btn active" style="flex:1;text-align:center" onclick="switchThreshTab('prec_loss',this)">🔴 Non-4 Promoted</button>
+    <button class="em-filter-btn" style="flex:1;text-align:center" onclick="switchThreshTab('prec_gain',this)">🟢 Non-4 Demoted</button>
+    <button class="em-filter-btn" style="flex:1;text-align:center" onclick="switchThreshTab('rec_gain',this)">🟢 4s Promoted</button>
+    <button class="em-filter-btn" style="flex:1;text-align:center" onclick="switchThreshTab('rec_loss',this)">🔴 4s Demoted</button>
+  </div>
+
+  <input type="text" class="search-bar" id="thresh-search" placeholder="Search queries..."
+         oninput="renderThreshQueries()" style="width:100%;padding:10px 14px;
+         background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;
+         color:#1a202c;margin-bottom:10px;">
+  <div class="em-split">
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px" id="thresh-queries-header">Queries (click to explore)</h3>
+      <div class="em-query-list" id="thresh-query-list"></div></div>
+    <div><h3 style="font-size:14px;color:#6b7280;margin-bottom:8px" id="thresh-items-header">Select a query</h3>
+      <div class="em-items-panel" id="thresh-items-list"></div></div>
+  </div>
+</div>
+
+</div><!-- /tab-em -->
+
 </div><!-- /container -->
 
 <script>
@@ -647,6 +1247,26 @@ const STRATUM_BREAKDOWN  = {stratum_breakdown_json};
 const HAS_DUAL_PRESO     = {'true' if has_dual_preso else 'false'};
 const VARIANT_PTSS       = {json.dumps(variant_ptss)};
 const VARIANT_TRSP       = {json.dumps(variant_trsp)};
+
+// ── EM Classifier data ────────────────────────────────────────────────────
+const EM_STATS             = {em_stats_json};
+const EM_PRECISION_QUERIES = {em_precision_queries_json};
+const EM_PRECISION_ITEMS   = {em_precision_items_json};
+const EM_RECALL_QUERIES    = {em_recall_queries_json};
+const EM_RECALL_ITEMS      = {em_recall_items_json};
+const EM_IMPROVEMENT_QUERIES        = {em_improvement_queries_json};
+const EM_IMPROVEMENT_ITEMS          = {em_improvement_items_json};
+const EM_RECALL_IMPROVEMENT_QUERIES = {em_recall_improvement_queries_json};
+const EM_RECALL_IMPROVEMENT_ITEMS   = {em_recall_improvement_items_json};
+const THRESH_PREC_LOSS_QUERIES  = {thresh_prec_loss_queries_json};
+const THRESH_PREC_LOSS_ITEMS    = {thresh_prec_loss_items_json};
+const THRESH_REC_GAIN_QUERIES   = {thresh_rec_gain_queries_json};
+const THRESH_REC_GAIN_ITEMS     = {thresh_rec_gain_items_json};
+const THRESH_PREC_GAIN_QUERIES  = {thresh_prec_gain_queries_json};
+const THRESH_PREC_GAIN_ITEMS    = {thresh_prec_gain_items_json};
+const THRESH_REC_LOSS_QUERIES   = {thresh_rec_loss_queries_json};
+const THRESH_REC_LOSS_ITEMS     = {thresh_rec_loss_items_json};
+const HAS_STACK            = {'true' if has_stack else 'false'};
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 function diffClassLabel(d, label) {{
@@ -953,6 +1573,319 @@ function showItemGrid(rawQuery, cleanQuery, rowEl) {{
 function closeItemPanel() {{
   document.getElementById('item-panel').classList.remove('visible');
   if (activeRow) {{ activeRow.classList.remove('active-row'); activeRow = null; }}
+}}
+
+// ── Top-level tab switching ────────────────────────────────────────────────
+function switchTopTab(tab) {{
+  document.querySelectorAll('.top-tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.top-tab').forEach(el => {{ el.classList.remove('active','active-red'); }});
+  document.getElementById('tab-' + tab).classList.add('active');
+  const btns = document.querySelectorAll('.top-tab');
+  if (tab === 'recall') btns[0].classList.add('active');
+  else {{ btns[1].classList.add('active-red'); if (!emInitialized) initEmTab(); }}
+}}
+
+// ── EM Classifier tab ─────────────────────────────────────────────────────
+let emInitialized = false;
+let emPiFilter = 'all';
+
+function initEmTab() {{
+  if (!HAS_STACK) return;
+  emInitialized = true;
+
+  // Baseline comparison
+  document.getElementById('em-ctrl-prec').textContent = EM_STATS.ctrl_primary_prec + '%';
+  document.getElementById('em-ctrl-rec').textContent = EM_STATS.ctrl_primary_rec + '%';
+  document.getElementById('em-ctrl-total').textContent = (EM_STATS.ctrl_primary_total || 0).toLocaleString();
+  document.getElementById('em-ctrl-recall4s').textContent = (EM_STATS.ctrl_recall_4s || 0).toLocaleString();
+  document.getElementById('em-var-prec').textContent = EM_STATS.var_primary_prec + '%';
+  document.getElementById('em-var-rec').textContent = EM_STATS.var_primary_rec + '%';
+  document.getElementById('em-var-total').textContent = (EM_STATS.var_primary_total || 0).toLocaleString();
+  document.getElementById('em-var-recall4s').textContent = (EM_STATS.var_recall_4s || 0).toLocaleString();
+
+  // Delta stat cards
+  document.getElementById('em-pi-total').textContent = (EM_STATS.precision_total || 0).toLocaleString();
+  document.getElementById('em-ri-total').textContent = (EM_STATS.recall_total || 0).toLocaleString();
+  document.getElementById('em-pimprv-total').textContent = (EM_STATS.prec_improvement_total || 0).toLocaleString();
+  document.getElementById('em-rimprv-total').textContent = (EM_STATS.recall_improvement_total || 0).toLocaleString();
+
+  // Net verdict
+  const netP = EM_STATS.net_precision || 0;
+  const netR = EM_STATS.net_recall || 0;
+  document.getElementById('em-net-prec').textContent = (netP > 0 ? '+' : '') + netP.toLocaleString();
+  document.getElementById('em-net-rec').textContent = (netR > 0 ? '+' : '') + netR.toLocaleString();
+  document.getElementById('em-net-prec-sub').textContent = netP >= 0 ? 'Fewer bad items (good)' : 'More bad items (bad)';
+  document.getElementById('em-net-rec-sub').textContent = netR >= 0 ? 'More good items surfaced' : 'Good items lost';
+  const npCard = document.getElementById('em-net-prec-card');
+  const nrCard = document.getElementById('em-net-rec-card');
+  npCard.classList.add(netP >= 0 ? 'green' : 'red');
+  nrCard.classList.add(netR >= 0 ? 'green' : 'red');
+
+  // Insights
+  const l1pct = EM_STATS.precision_total ? (EM_STATS.precision_label_1/EM_STATS.precision_total*100).toFixed(1) : 0;
+  document.getElementById('em-insight-1').innerHTML =
+    '<strong>Net Verdict:</strong> ' +
+    (netP >= 0 ? '✅ Precision improved by ' + Math.abs(netP).toLocaleString() + ' items' : '⚠️ Precision degraded by ' + Math.abs(netP).toLocaleString() + ' items') +
+    ' &nbsp;|&nbsp; ' +
+    (netR >= 0 ? '✅ Recall improved by ' + Math.abs(netR).toLocaleString() + ' items' : '⚠️ Recall degraded by ' + Math.abs(netR).toLocaleString() + ' items') +
+    '. Variant recall set has ' + (EM_STATS.new_to_recall_total || 0).toLocaleString() + ' new items and lost ' +
+    (EM_STATS.lost_from_recall_total || 0).toLocaleString() + '.';
+  document.getElementById('em-insight-2').innerHTML =
+    '<strong>Position Impact:</strong> ' + (EM_STATS.precision_in_top10 || 0).toLocaleString() +
+    ' precision failures in top-10 positions (most visible). ' + l1pct + '% of failures are label-1 (irrelevant). Mean failure position: ' + (EM_STATS.precision_mean_pos || 0) + '.';
+
+  // Label bars
+  const piTotal = EM_STATS.precision_total || 1;
+  const bars = [
+    {{label:'Label 1 (Irrelevant)', count:EM_STATS.precision_label_1 || 0, color:'#ef4444'}},
+    {{label:'Label 2 (Poor)',       count:EM_STATS.precision_label_2 || 0, color:'#f97316'}},
+    {{label:'Label 3 (Fair)',       count:EM_STATS.precision_label_3 || 0, color:'#84cc16'}},
+  ];
+  document.getElementById('em-label-bars').innerHTML = bars.map(b => `
+    <div class="em-chart-bar">
+      <div class="em-chart-label">${{b.label}}</div>
+      <div class="em-chart-track"><div class="em-chart-fill" style="width:${{b.count/piTotal*100}}%;background:${{b.color}}">${{b.count.toLocaleString()}}</div></div>
+    </div>`).join('');
+
+  // Category bars
+  const cats = EM_STATS.precision_by_category || {{}};
+  const catEntries = Object.entries(cats).slice(0, 10);
+  const catMax = catEntries.length ? catEntries[0][1] : 1;
+  document.getElementById('em-category-bars').innerHTML = catEntries.map(([k,v]) => `
+    <div class="em-chart-bar">
+      <div class="em-chart-label">${{k}}</div>
+      <div class="em-chart-track"><div class="em-chart-fill" style="width:${{v/catMax*100}}%;background:#8b5cf6">${{v.toLocaleString()}}</div></div>
+    </div>`).join('');
+
+  renderEmPrecisionQueries();
+  renderEmRecallQueries();
+  renderEmImprovementQueries();
+  renderEmRecallImprovementQueries();
+  initThreshSection();
+}}
+
+// ── Precision Failures ─────────────────────────────────────────────────
+function renderEmPrecisionQueries() {{
+  const search = (document.getElementById('em-pi-search').value || '').toLowerCase();
+  let qs = EM_PRECISION_QUERIES.filter(q => q.cleanQuery.toLowerCase().includes(search));
+  const container = document.getElementById('em-pi-query-list');
+  let html = '<table class="query-table" style="font-size:13px"><thead><tr>' +
+    '<th>Query</th><th style="width:60px">Count</th><th style="width:50px">L1</th>' +
+    '<th style="width:50px">L2</th><th style="width:50px">L3</th><th style="width:60px">Top20</th></tr></thead><tbody>';
+  qs.forEach(q => {{
+    html += `<tr onclick="showEmPrecisionItems('${{q.query.replace(/'/g,"\\\\'")}}')">
+      <td style="max-width:240px;word-break:break-word">${{q.cleanQuery}}</td>
+      <td><span style="background:#fee2e2;color:#991b1b;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px">${{q.count}}</span></td>
+      <td>${{q.label_1}}</td><td>${{q.label_2}}</td><td>${{q.label_3}}</td>
+      <td>${{q.top20 > 0 ? '<span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px">' + q.top20 + '</span>' : '-'}}</td>
+    </tr>`;
+  }});
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}}
+
+function showEmPrecisionItems(query) {{
+  let items = EM_PRECISION_ITEMS.filter(i => i.query === query);
+  if (emPiFilter === 'top20') items = items.filter(i => i.position <= 20);
+  else if (emPiFilter !== 'all') items = items.filter(i => i.label === emPiFilter);
+  items.sort((a,b) => a.position - b.position);
+  const cq = EM_PRECISION_QUERIES.find(q => q.query === query);
+  document.getElementById('em-pi-items-header').textContent =
+    items.length + ' items for: ' + (cq ? cq.cleanQuery : query.split(' (')[0]);
+  document.getElementById('em-pi-items-list').innerHTML = items.length
+    ? items.map(renderEmItemCard).join('')
+    : '<p style="color:#9ca3af;padding:20px;text-align:center">No items match filter.</p>';
+}}
+
+// ── Precision Improvements ──────────────────────────────────────────────
+function renderEmImprovementQueries() {{
+  const search = (document.getElementById('em-pimprv-search').value || '').toLowerCase();
+  let qs = EM_IMPROVEMENT_QUERIES.filter(q => q.cleanQuery.toLowerCase().includes(search));
+  const container = document.getElementById('em-pimprv-query-list');
+  let html = '<table class="query-table" style="font-size:13px"><thead><tr>' +
+    '<th>Query</th><th style="width:60px">Count</th><th style="width:50px">L1</th>' +
+    '<th style="width:50px">L2</th><th style="width:50px">L3</th></tr></thead><tbody>';
+  qs.forEach(q => {{
+    html += `<tr onclick="showEmImprovementItems('${{q.query.replace(/'/g,"\\\\'")}}')">
+      <td style="max-width:240px;word-break:break-word">${{q.cleanQuery}}</td>
+      <td><span style="background:#d1fae5;color:#065f46;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px">${{q.count}}</span></td>
+      <td>${{q.label_1 || 0}}</td><td>${{q.label_2 || 0}}</td><td>${{q.label_3 || 0}}</td>
+    </tr>`;
+  }});
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}}
+
+function showEmImprovementItems(query) {{
+  const items = EM_IMPROVEMENT_ITEMS.filter(i => i.query === query).sort((a,b) => a.position - b.position);
+  const cq = EM_IMPROVEMENT_QUERIES.find(q => q.query === query);
+  document.getElementById('em-pimprv-items-header').textContent =
+    items.length + ' removed non-4s for: ' + (cq ? cq.cleanQuery : query.split(' (')[0]);
+  document.getElementById('em-pimprv-items-list').innerHTML = items.length
+    ? items.map(renderEmItemCard).join('')
+    : '<p style="color:#9ca3af;padding:20px;text-align:center">No items.</p>';
+}}
+
+// ── Recall Failures ─────────────────────────────────────────────────────
+function renderEmRecallQueries() {{
+  const search = (document.getElementById('em-ri-search').value || '').toLowerCase();
+  let qs = EM_RECALL_QUERIES.filter(q => q.cleanQuery.toLowerCase().includes(search));
+  const container = document.getElementById('em-ri-query-list');
+  let html = '<table class="query-table" style="font-size:13px"><thead><tr>' +
+    '<th>Query</th><th style="width:80px">Blocked 4s</th><th style="width:80px">Segment</th></tr></thead><tbody>';
+  qs.forEach(q => {{
+    html += `<tr onclick="showEmRecallItems('${{q.query.replace(/'/g,"\\\\'")}}')">
+      <td style="max-width:280px;word-break:break-word">${{q.cleanQuery}}</td>
+      <td><span style="background:#fef3c7;color:#92400e;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px">${{q.count}}</span></td>
+      <td style="font-size:11px">${{q.stratum || ''}}</td>
+    </tr>`;
+  }});
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}}
+
+function showEmRecallItems(query) {{
+  const items = EM_RECALL_ITEMS.filter(i => i.query === query).sort((a,b) => a.position - b.position);
+  const cq = EM_RECALL_QUERIES.find(q => q.query === query);
+  document.getElementById('em-ri-items-header').textContent =
+    items.length + ' blocked 4s for: ' + (cq ? cq.cleanQuery : query.split(' (')[0]);
+  document.getElementById('em-ri-items-list').innerHTML = items.length
+    ? items.map(i => renderEmItemCard(i, true)).join('')
+    : '<p style="color:#9ca3af;padding:20px;text-align:center">No items.</p>';
+}}
+
+// ── Recall Improvements ─────────────────────────────────────────────────
+function renderEmRecallImprovementQueries() {{
+  const search = (document.getElementById('em-rimprv-search').value || '').toLowerCase();
+  let qs = EM_RECALL_IMPROVEMENT_QUERIES.filter(q => q.cleanQuery.toLowerCase().includes(search));
+  const container = document.getElementById('em-rimprv-query-list');
+  let html = '<table class="query-table" style="font-size:13px"><thead><tr>' +
+    '<th>Query</th><th style="width:80px">New 4s</th><th style="width:80px">Segment</th></tr></thead><tbody>';
+  qs.forEach(q => {{
+    html += `<tr onclick="showEmRecallImprovementItems('${{q.query.replace(/'/g,"\\\\'")}}')">
+      <td style="max-width:280px;word-break:break-word">${{q.cleanQuery}}</td>
+      <td><span style="background:#d1fae5;color:#065f46;padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px">${{q.count}}</span></td>
+      <td style="font-size:11px">${{q.stratum || ''}}</td>
+    </tr>`;
+  }});
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}}
+
+function showEmRecallImprovementItems(query) {{
+  const items = EM_RECALL_IMPROVEMENT_ITEMS.filter(i => i.query === query).sort((a,b) => a.position - b.position);
+  const cq = EM_RECALL_IMPROVEMENT_QUERIES.find(q => q.query === query);
+  document.getElementById('em-rimprv-items-header').textContent =
+    items.length + ' new 4s promoted for: ' + (cq ? cq.cleanQuery : query.split(' (')[0]);
+  document.getElementById('em-rimprv-items-list').innerHTML = items.length
+    ? items.map(renderEmItemCard).join('')
+    : '<p style="color:#9ca3af;padding:20px;text-align:center">No items.</p>';
+}}
+
+// ── Shared item card renderer ───────────────────────────────────────────
+function renderEmItemCard(item, isRecall) {{
+  const lblCls = 'lbl-' + item.label;
+  const posHot = item.position <= 20 ? 'background:#fee2e2;color:#991b1b;' : '';
+  return `<div class="em-item-card">
+    ${{item.image ? '<img class="em-item-img" src="' + item.image + '" onerror="this.style.display=\\'none\\'">' : ''}}
+    <div class="em-item-info">
+      <div class="em-item-title">${{item.title || item.pg_prod_id}}</div>
+      <div class="em-item-meta">
+        <span><strong>ID:</strong> ${{item.pg_prod_id}}</span>
+        <span style="padding:1px 6px;border-radius:3px;font-size:11px;font-weight:600;${{posHot}}">${{isRecall ? 'Stack ' + item.stack + ' / Pos #' + item.position : 'Pos #' + item.position}}</span>
+        <span><strong>Cat:</strong> ${{item.l1_category || '-'}}</span>
+      </div>
+    </div>
+    <span class="item-label ${{lblCls}}">${{item.label}}★</span>
+  </div>`;
+}}
+
+// ── Threshold Effects tab ────────────────────────────────────────────────
+let activeThreshTab = 'prec_loss';
+const THRESH_DATA = {{
+  prec_loss: {{ queries: THRESH_PREC_LOSS_QUERIES, items: THRESH_PREC_LOSS_ITEMS, hasLabels: true }},
+  prec_gain: {{ queries: THRESH_PREC_GAIN_QUERIES, items: THRESH_PREC_GAIN_ITEMS, hasLabels: true }},
+  rec_gain:  {{ queries: THRESH_REC_GAIN_QUERIES,  items: THRESH_REC_GAIN_ITEMS,  hasLabels: false }},
+  rec_loss:  {{ queries: THRESH_REC_LOSS_QUERIES,  items: THRESH_REC_LOSS_ITEMS,  hasLabels: false }},
+}};
+
+function initThreshSection() {{
+  // Summary cards
+  document.getElementById('thresh-stable-total').textContent = (EM_STATS.stable_recall_total || 0).toLocaleString();
+  document.getElementById('thresh-prec-loss-val').textContent = (EM_STATS.thresh_prec_loss || 0).toLocaleString();
+  document.getElementById('thresh-prec-loss-q').textContent = (EM_STATS.thresh_prec_loss_queries || 0) + ' queries';
+  document.getElementById('thresh-prec-gain-val').textContent = (EM_STATS.thresh_prec_gain || 0).toLocaleString();
+  document.getElementById('thresh-prec-gain-q').textContent = (EM_STATS.thresh_prec_gain_queries || 0) + ' queries';
+  document.getElementById('thresh-rec-gain-val').textContent = (EM_STATS.thresh_rec_gain || 0).toLocaleString();
+  document.getElementById('thresh-rec-gain-q').textContent = (EM_STATS.thresh_rec_gain_queries || 0) + ' queries';
+  document.getElementById('thresh-rec-loss-val').textContent = (EM_STATS.thresh_rec_loss || 0).toLocaleString();
+  document.getElementById('thresh-rec-loss-q').textContent = (EM_STATS.thresh_rec_loss_queries || 0) + ' queries';
+
+  // Net threshold verdict
+  const tnp = EM_STATS.thresh_net_prec || 0;
+  const tnr = EM_STATS.thresh_net_rec || 0;
+  document.getElementById('thresh-net-prec').textContent = (tnp > 0 ? '+' : '') + tnp.toLocaleString();
+  document.getElementById('thresh-net-rec').textContent = (tnr > 0 ? '+' : '') + tnr.toLocaleString();
+  document.getElementById('thresh-net-prec-sub').textContent = tnp >= 0 ? 'More non-4s demoted than promoted' : 'More non-4s promoted than demoted';
+  document.getElementById('thresh-net-rec-sub').textContent = tnr >= 0 ? 'More 4s promoted than demoted' : 'More 4s demoted than promoted';
+  document.getElementById('thresh-net-prec-card').classList.add(tnp >= 0 ? 'green' : 'red');
+  document.getElementById('thresh-net-rec-card').classList.add(tnr >= 0 ? 'green' : 'red');
+
+  // Insight
+  document.getElementById('thresh-insight').innerHTML =
+    '<strong>Threshold Shift Analysis:</strong> Of ' + (EM_STATS.stable_recall_total || 0).toLocaleString() +
+    ' items in both recall sets, ' +
+    ((EM_STATS.thresh_prec_loss || 0) + (EM_STATS.thresh_rec_gain || 0)).toLocaleString() + ' were promoted and ' +
+    ((EM_STATS.thresh_prec_gain || 0) + (EM_STATS.thresh_rec_loss || 0)).toLocaleString() + ' were demoted from primary stack. ' +
+    'Net precision: ' + (tnp >= 0 ? '✅ +' : '⚠️ ') + Math.abs(tnp).toLocaleString() + ' &nbsp;|&nbsp; ' +
+    'Net recall: ' + (tnr >= 0 ? '✅ +' : '⚠️ ') + Math.abs(tnr).toLocaleString();
+
+  renderThreshQueries();
+}}
+
+function switchThreshTab(tab, btn) {{
+  activeThreshTab = tab;
+  document.getElementById('thresh-subtabs').querySelectorAll('.em-filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('thresh-items-list').innerHTML = '';
+  document.getElementById('thresh-items-header').textContent = 'Select a query';
+  renderThreshQueries();
+}}
+
+function renderThreshQueries() {{
+  const d = THRESH_DATA[activeThreshTab];
+  const search = (document.getElementById('thresh-search').value || '').toLowerCase();
+  let qs = d.queries.filter(q => q.cleanQuery.toLowerCase().includes(search));
+  const container = document.getElementById('thresh-query-list');
+
+  let headers = '<th>Query</th><th style="width:60px">Count</th>';
+  if (d.hasLabels) headers += '<th style="width:50px">L1</th><th style="width:50px">L2</th><th style="width:50px">L3</th>';
+  else headers += '<th style="width:80px">Segment</th>';
+
+  let html = '<table class="query-table" style="font-size:13px"><thead><tr>' + headers + '</tr></thead><tbody>';
+  qs.forEach(q => {{
+    const badge = activeThreshTab.includes('gain') || activeThreshTab === 'prec_gain'
+      ? 'background:#d1fae5;color:#065f46' : 'background:#fee2e2;color:#991b1b';
+    html += `<tr onclick="showThreshItems('${{q.query.replace(/'/g,"\\\\'")}}')">
+      <td style="max-width:240px;word-break:break-word">${{q.cleanQuery}}</td>
+      <td><span style="${{badge}};padding:2px 8px;border-radius:4px;font-weight:600;font-size:12px">${{q.count}}</span></td>`;
+    if (d.hasLabels) html += `<td>${{q.label_1 || 0}}</td><td>${{q.label_2 || 0}}</td><td>${{q.label_3 || 0}}</td>`;
+    else html += `<td style="font-size:11px">${{q.stratum || ''}}</td>`;
+    html += '</tr>';
+  }});
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}}
+
+function showThreshItems(query) {{
+  const d = THRESH_DATA[activeThreshTab];
+  const items = d.items.filter(i => i.query === query).sort((a,b) => a.position - b.position);
+  const cq = d.queries.find(q => q.query === query);
+  document.getElementById('thresh-items-header').textContent =
+    items.length + ' items for: ' + (cq ? cq.cleanQuery : query.split(' (')[0]);
+  document.getElementById('thresh-items-list').innerHTML = items.length
+    ? items.map(i => renderEmItemCard(i, true)).join('')
+    : '<p style="color:#9ca3af;padding:20px;text-align:center">No items.</p>';
 }}
 
 // Boot
