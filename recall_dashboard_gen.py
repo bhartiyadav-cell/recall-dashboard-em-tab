@@ -396,10 +396,10 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
     stratum_breakdown_json = json.dumps(stratum_breakdown)
 
     # ── EM Classifier Analysis (stack-based) ─────────────────────────────────
-    # Uses the FULL dataframe (not impacted-only) since stack analysis needs
-    # complete recall sets to identify what's new vs what moved between stacks.
+    # Uses impacted-only rows (df_imp) so all analyses are scoped to queries
+    # where control and variant diverge — consistent with the recall tab.
     print("\nComputing EM Classifier analysis...")
-    has_stack = 'stack' in df.columns
+    has_stack = 'stack' in df_imp.columns
     em_stats = {}
     em_precision_queries = []
     em_precision_items = []
@@ -419,8 +419,8 @@ def build_dashboard(parquet_path: str, output_path: str, experiment_id: str, gcs
     thresh_rec_loss_items = []
 
     if has_stack:
-        ctrl_all = df[df['engine'] == CONTROL_ENGINE]
-        var_all  = df[df['engine'] == VARIANT_ENGINE]
+        ctrl_all = df_imp[df_imp['engine'] == CONTROL_ENGINE]
+        var_all  = df_imp[df_imp['engine'] == VARIANT_ENGINE]
 
         # Build recall sets (all stacks) and primary stack sets (stack 1)
         ctrl_recall_set  = set(zip(ctrl_all['contextualQuery'], ctrl_all['pg_prod_id']))
