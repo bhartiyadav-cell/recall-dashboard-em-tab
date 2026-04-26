@@ -78,9 +78,11 @@ def resolve_parquet(gcs_path: str, subfolder: str | None, cache_dir: str, experi
     """
     Find and download qip_scores.parquet. Tries (in order):
       1. --subfolder argument if given
-      2. impacted/
+      2. impacted/          ← preferred (pre-filtered, fastest)
       3. sample-1000/
-      4. root of gcs_path
+      4. sample-5000/
+      5. root of gcs_path
+    Note: dashboard always filters to impacted=True rows regardless of source.
     Returns (local file path, resolved subfolder string).
     """
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -90,7 +92,7 @@ def resolve_parquet(gcs_path: str, subfolder: str | None, cache_dir: str, experi
         size_mb = Path(local_path).stat().st_size / 1024 / 1024
         print(f"  Using cached parquet: {local_path} ({size_mb:.1f} MB)")
         # Best-effort: figure out which subfolder it came from
-        for sf in (subfolder, "impacted", "sample-1000", ""):
+        for sf in (subfolder, "impacted", "sample-1000", "sample-5000", ""):
             if sf is None: continue
             uri = f"{gcs_path.rstrip('/')}/{sf}/qip_scores.parquet" if sf else f"{gcs_path.rstrip('/')}/qip_scores.parquet"
             if gcs_exists(uri):
@@ -102,13 +104,15 @@ def resolve_parquet(gcs_path: str, subfolder: str | None, cache_dir: str, experi
         candidates = [(subfolder, f"{gcs_path.rstrip('/')}/{subfolder}/qip_scores.parquet")]
     else:
         candidates = [
-            ("impacted",     f"{gcs_path.rstrip('/')}/impacted/qip_scores.parquet"),
-            ("sample-1000",  f"{gcs_path.rstrip('/')}/sample-1000/qip_scores.parquet"),
-            ("",             f"{gcs_path.rstrip('/')}/qip_scores.parquet"),
+            ("impacted",    f"{gcs_path.rstrip('/')}/impacted/qip_scores.parquet"),
+            ("sample-1000", f"{gcs_path.rstrip('/')}/sample-1000/qip_scores.parquet"),
+            ("sample-5000", f"{gcs_path.rstrip('/')}/sample-5000/qip_scores.parquet"),
+            ("",            f"{gcs_path.rstrip('/')}/qip_scores.parquet"),
         ]
 
     for sf, uri in candidates:
         if gcs_exists(uri):
+            print(f"  ℹ️  Using subfolder: '{sf or 'root'}' — dashboard will filter to impacted=True rows")
             gcs_download(uri, local_path)
             return local_path, sf
 
